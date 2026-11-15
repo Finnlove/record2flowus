@@ -34,6 +34,8 @@ def load_config():
             cfg.update(data)
         except Exception as e:
             print(f"ERROR: failed to load config file '{p}': {e}", file=sys.stderr)
+            print("Fix: correct the JSON syntax/structure in the file above, or run `python scripts/setup.py` to rebuild config.local.json.", file=sys.stderr)
+            print("Tip: run `python scripts/doctor.py` for a full diagnostic.", file=sys.stderr)
             raise SystemExit(2)
     return cfg
 
@@ -572,22 +574,69 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("[bridge] " + (fmt % args) + "\n")
 
 
+def _print_startup_help(msg, fix=None):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    if fix:
+        print(f"Fix: {fix}", file=sys.stderr)
+    print("Tip: run `python scripts/doctor.py` for diagnostics, or `python scripts/setup.py` to configure.", file=sys.stderr)
+
+
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        # lightweight config/startup checks without serving
+        if not BRIDGE_TOKEN:
+            _print_startup_help("bridge_token is not configured.", "Run `python scripts/setup.py` to generate a token, save it in config.local.json, and set the SAME token in the extension Options.")
+            sys.exit(2)
+        if len(BRIDGE_TOKEN) < 32:
+            _print_startup_help("bridge_token is too short (must be >= 32 characters).", "Generate a new high-entropy token via `python scripts/setup.py` and update extension Options.")
+            sys.exit(2)
+        if not ALLOWED_ORIGIN:
+            print("WARNING: bridge_allowed_origin is not configured; browser requests with Origin will be rejected.", file=sys.stderr)
+            print("Fix: load the unpacked extension, copy its ID, set bridge_allowed_origin=chrome-extension://<ID> in config.local.json, then restart bridge.", file=sys.stderr)
+        print(f"OK: config checks passed for http://{HOST}:{PORT}")
+        sys.exit(0)
+
     if HOST != "127.0.0.1":
         raise RuntimeError("Bridge must bind to 127.0.0.1")
     if not BRIDGE_TOKEN:
-        print("ERROR: bridge_token is not configured. Set it in config.local.json (or BRIDGE_TOKEN env).", file=sys.stderr)
+        _print_startup_help(
+            "bridge_token is not configured.",
+            "Run `python scripts/setup.py` to generate a token, save it in config.local.json, and set the SAME token in the extension Options page.",
+        )
         sys.exit(2)
     if len(BRIDGE_TOKEN) < 32:
-        print("ERROR: bridge_token is too short. Use a high-entropy random token with at least 32 characters.", file=sys.stderr)
+        _print_startup_help(
+            "bridge_token is too short (must be >= 32 characters).",
+            "Generate a new high-entropy token via `python scripts/setup.py`, update config.local.json, and update the extension Options.",
+        )
         sys.exit(2)
     if not ALLOWED_ORIGIN:
         print("WARNING: bridge_allowed_origin is not configured; browser requests with Origin will be rejected.", file=sys.stderr)
+        print("Fix: open chrome://extensions, copy the extension ID, set bridge_allowed_origin=chrome-extension://<ID> in config.local.json, then restart bridge.", file=sys.stderr)
+    elif not re.fullmatch(r"chrome-extension://[a-p]{32}", ALLOWED_ORIGIN):
+        print(f"WARNING: bridge_allowed_origin format looks invalid: {ALLOWED_ORIGIN}", file=sys.stderr)
+        print("Fix: use chrome-extension://<32 lowercase letters a-p> matching your loaded extension ID.", file=sys.stderr)
+
     print(f"Bridge listening on http://{HOST}:{PORT}")
     print(f"HEX_EXE={HEX_EXE}")
     print(f"SYNC_SCRIPT={SYNC_SCRIPT}")
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        server = ThreadingHTTPServer((HOST, PORT), Handler)
+    except OSError as e:
+        if getattr(e, "errno", None) in (98, 10048) or "address already in use" in str(e).lower() or "only one usage" in str(e).lower():
+            _print_startup_help(
+                f"port {PORT} is already in use on 127.0.0.1.",
+                "Stop the process using this port, or change bridge_port in config.local.json (and set the SAME port in extension Options), then start again.",
+            )
+            sys.exit(2)
+        _print_startup_help(f"failed to start server: {e}", "Check host/port permissions and configuration, then retry.")
+        sys.exit(2)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
