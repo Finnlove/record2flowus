@@ -28,7 +28,7 @@
 - **先理解仓库，再执行操作**：先读 `README.md`、`docs/quickstart-windows.md`、`docs/troubleshooting.md`、`docs/milestone-2-productization.md`，再检查 `setup.cmd`/`doctor.cmd`/`start.cmd`、`bridge.py`、`scripts/`、`extension/` 的实际行为与字段。
 - **优先使用项目现有脚本/入口**：配置用 `setup.cmd`/`python scripts/setup.py`，诊断用 `doctor.cmd`/`python scripts/doctor.py`，预检/启动用 `start.cmd` 或 `python bridge.py --check` / `python bridge.py`；不要臆造不存在的命令或参数。
 - **不重复安装已满足的依赖**：先用 `doctor.cmd`、`python --version`、`flowus --json whoami` 等验证现状，再建议安装。
-- **操作前检查现有配置**：优先查看 `config.local.json`（及可能存在的 `config.json`）的**结构与字段是否就绪**；避免盲目覆盖。注意：`config.local.json`/`config.json` 已在 `.gitignore` 中，且可能包含密钥——**读取/展示时必须脱敏**，不得在输出、日志、补丁或提交中暴露真实 token/凭据。
+- **操作前检查现有配置**：优先查看 `config.local.json`（及可能存在的 `config.json`）的**结构与字段是否就绪**；避免盲目覆盖。注意：`config.local.json`/`config.json` 已在 `.gitignore` 中，且可能包含密钥——**读取/展示时必须脱敏**；不得将真实 token/凭据暴露在对话输出、日志、补丁或提交中。`scripts/setup.py` 在生成/更新 `bridge_token` 时会在**本地终端向用户**显示新 token 以便复制到扩展选项（合理的本地安装行为）；Agent **不得**将包含 token 的终端输出、配置文件内容或截图文本转发/复述到对话、日志、补丁或提交中，应仅提示用户“已在本地终端生成/显示，请自行复制并妥善保存”。
 - **保留用户已有配置和数据**：不删除/覆盖用户录音、转写、导出、`config.local.json`、FlowUs 页面内容，除非用户明确授权且已说明风险。
 - **每个阶段执行后都进行验证**：区分“命令返回 0/无报错”与“对应阶段真实成功”（见第 6 节验收分层）。
 - **发生错误时先诊断，不盲目重复执行**：优先 `doctor.cmd`、`python bridge.py --check`、扩展选项页“测试连接”、桥接控制台输出；对照 `docs/troubleshooting.md` 定位。避免在未知状态下反复点击录制/停止或重试上传（可能造成重复追加，且无幂等保护）。
@@ -83,7 +83,9 @@
 | `hex_export_dir` | Hex 导出目录（可选） | 用于转写路径解析的允许目录之一（以实现为准）。 |
 | `sync_script` | 桥接调用的同步脚本路径 | 默认 `scripts/sync_to_flowus.py`（仓库布局）；相对路径相对仓库/桥接目录解析（以 `bridge.py` 为准）。 |
 
-- **禁止**：在回复、日志、截图文本、Issue、提交或代码中写入真实 Token、密码、Cookie、个人页面/数据库/会议 ID 等敏感信息；引用配置时仅可说明字段名、格式要求与脱敏状态（如“已配置/长度不足/占位符”）。
+- **区分与禁止**：
+  - **允许（本地产品行为）**：本地安装/配置程序（如 `scripts/setup.py`）在用户本机终端向用户展示新生成的 `bridge_token`，供用户复制到扩展选项与本地配置。
+  - **禁止（Agent 行为）**：将真实 token/密码/Cookie 等凭据写入或转发到对话回复、日志、截图文本、Issue、补丁、代码或 Git 提交；不得代用户从终端输出中提取并复述 token。引用配置时仅可说明字段名、格式要求与脱敏状态（如“已配置/长度不足/占位符/已在本地终端显示”）。
 
 ---
 

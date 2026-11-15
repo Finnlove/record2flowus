@@ -144,6 +144,10 @@ Useful options: `--meeting-id`, `--meetings-dir`, `--summary-file`, `--mindmap-j
 │  ├─ quickstart-windows.md
 │  ├─ troubleshooting.md
 │  └─ milestone-2-productization.md
+├─ tests/                     # Text-processing regression tests (unittest)
+│  ├─ __init__.py
+│  └─ test_bridge_text.py
+├─ AGENTS.md                  # Agent-first usage and safety/specification
 ├─ bridge.py                  # Local authenticated HTTP bridge
 ├─ config.example.json
 ├─ start.cmd / start-bridge.cmd / doctor.cmd / setup.cmd
