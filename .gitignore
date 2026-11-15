@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local/runtime
+config.local.json
+*.log
+*.tmp
+*.bak
+
+# Secrets / personal
+*.token
+*.key
+.env
+.env.*
+
+# Build artifacts
+dist/
+build/

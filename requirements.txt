@@ -1,0 +1,5 @@
+# Runtime uses Python standard library only.
+# External prerequisites (installed separately):
+# - Hex (local voice recording/transcription app with meetings CLI)
+# - FlowUs CLI (`flowus`) authenticated to your workspace
+# - Python 3.9+
