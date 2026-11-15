@@ -234,39 +234,77 @@ def _split_sentences(text):
     return out
 
 
-_FILLER_RE = re.compile(
-    r"(就是|然后呢|那么呢|那么|然后|所以呢|所以|这个呢|这个|那个呢|那个|嗯+|啊+|哈+|呀+|吧+|呢|嘛+|呃+|哦+|唉+|"
-    r"我想说的是|我觉得|就是说|其实|就是说呢|对吧|是不是|这样子?|这么一个|这样的一个|之类的|诸如此类的东西?)"
-)
+_FILLER_PHRASES = [
+    "我想说的是", "就是说呢", "就是说", "其实呢", "其实", "然后呢", "那么呢", "这个呢", "那个呢",
+    "这样子的", "这样的一个", "这么一个", "诸如此类的东西", "之类的东西", "之类的",
+]
 
 
-def _normalize_spoken(s):
+def _clean_spoken(s):
     if not s:
         return ""
     t = re.sub(r"\s+", " ", str(s)).strip()
-    # remove common filler/discourse markers (heuristic, may be imperfect)
-    for _ in range(2):
-        t = _FILLER_RE.sub("", t)
-        t = re.sub(r"\s+", " ", t).strip(" ，,。.!！？?；;：:·-—")
-    t = re.sub(r"([，,]){2,}", "，", t)
-    t = re.sub(r"^(好的|OK|ok|好)[，,\s]*", "", t)
-    return t.strip(" ，,。.!！？?；;：:·-—")
+    # remove standalone filler tokens (keep meaning, avoid over-deleting inside words)
+    t = re.sub(r"\b(?:OK|ok)\b[，,\s]*", "", t)
+    t = re.sub(r"(?:^|[，,。\s])(?:嗯+|啊+|呃+|哦+|唉+|哈+|呀+|吧|嘛)(?=[，,。\s]|$)", " ", t)
+    for p in _FILLER_PHRASES:
+        t = t.replace(p, "")
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"([，,])\s*([，,])+", "，", t)
+    t = re.sub(r"[，,]\s*([。！？!?])", r"\1", t)
+    t = t.strip(" \t\r\n-•·，,；;：:")
+    # drop leading dangling conjunctions/punctuation fragments
+    t = re.sub(r"^(?:所以|然后|那么|但是|不过|而且|因为|如果|就是|再一个就是|再一个|还有就是|还有|以及|并且|或者是说|或者)[，,、\s]*", "", t)
+    t = re.sub(r"\s+", " ", t).strip(" \t\r\n-•·，,；;：:")
+    return t
 
 
 def _sentence_key(s):
-    t = _normalize_spoken(s)
+    t = _clean_spoken(s)
     t = re.sub(r"[\s`*_~#>\[\]\(\)（）【】\"'“”‘’、，,。.!！？?；;：:·\-—]", "", t)
     return t[:40]
 
 
-def _condense_point(s, limit=70):
-    t = _normalize_spoken(s)
+def _is_complete_enough(s):
+    t = _clean_spoken(s).strip()
+    if len(re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)) < 8:
+        return False
+    # avoid obvious fragments ending with dangling connectors
+    if re.search(r"(的|了|呢|吗|吧|啊|在|把|和|与|及|或|对|给|向|从|到|是)$", t):
+        # short trailing particle can be ok if sentence-like, but be careful
+        if len(t) < 18:
+            return False
+    return True
+
+
+def _format_point(s, limit=88):
+    t = _clean_spoken(s)
     if not t:
         t = re.sub(r"\s+", " ", str(s or "")).strip()
-    t = t.strip(" ，,。.!！？?；;：:·-—")
+    t = t.strip(" \t\r\n-•·，,；;：:")
+    if not t:
+        return ""
+    # try to keep a complete sentence/clause: cut at nearest boundary before limit
     if len(t) > limit:
-        t = t[: limit - 1].rstrip(" ，,；;：:") + "…"
-    return t
+        window = t[:limit]
+        cut = -1
+        for sep in ["。", "！", "？", "；", "，", ",", " "]:
+            idx = window.rfind(sep)
+            if idx >= max(18, limit - 28):
+                cut = idx
+                break
+        if cut > 0:
+            t = window[:cut].rstrip(" \t\r\n-•·，,；;：:")
+        else:
+            t = window.rstrip(" \t\r\n-•·，,；;：:")
+        if t and not t.endswith(("。", "！", "？", "…")):
+            t += "…"
+    else:
+        # ensure it reads like a complete point
+        if not t.endswith(("。", "！", "？")):
+            t += "。"
+    t = re.sub(r"。{2,}", "。", t)
+    return t.strip()
 
 
 def _select_representative_sentences(text, limit=6):
@@ -274,41 +312,42 @@ def _select_representative_sentences(text, limit=6):
     sents = _split_sentences(text)
     scored = []
     for idx, s in enumerate(sents):
-        norm = _normalize_spoken(s)
-        plain = re.sub(r"[\s\W_]+", "", norm, flags=re.UNICODE)
-        if len(plain) < 6:
+        cleaned = _clean_spoken(s)
+        plain = re.sub(r"[\s\W_]+", "", cleaned, flags=re.UNICODE)
+        if len(plain) < 8:
             continue
-        # prefer sentences with substantive content; lightly penalize very short/very long
         score = len(plain)
-        if re.search(r"(因为|所以|为了|希望|想要|可以|能够|需要|问题|困难|方法|工具|目的|记录|整理|总结|提高|帮助|使用)", norm):
-            score += 8
-        scored.append((idx, s, norm, score))
+        if re.search(r"(因为|所以|为了|希望|想要|可以|能够|需要|问题|困难|方法|工具|目的|记录|整理|总结|提高|帮助|使用|插件|语音|转写|归档|学习)", cleaned):
+            score += 10
+        if _is_complete_enough(cleaned):
+            score += 4
+        scored.append((idx, s, cleaned, score))
     if not scored:
         return []
-    # sample across document: early/middle/late buckets
     n = len(scored)
-    picks, used = [], set()
+    picks = []
     if n <= limit:
-        candidates = scored
+        candidates = sorted(scored, key=lambda x: x[0])
     else:
-        buckets = [scored[: max(1, n // 3)], scored[max(1, n // 3): max(2, 2 * n // 3)], scored[max(2, 2 * n // 3):]]
+        third = max(1, n // 3)
+        buckets = [scored[:third], scored[third:2*third], scored[2*third:]]
         candidates = []
-        # take best from each bucket first, then fill by score
         for b in buckets:
             if b:
-                candidates.append(max(b, key=lambda x: x[3]))
+                candidates.extend(sorted(b, key=lambda x: -x[3])[:2])
         for item in sorted(scored, key=lambda x: (-x[3], x[0])):
             if item not in candidates:
                 candidates.append(item)
-    for idx, s, norm, _ in candidates:
+        candidates = sorted(candidates[: limit * 3], key=lambda x: x[0])
+    used = set()
+    for idx, s, cleaned, _ in candidates:
         k = _sentence_key(s)
         if not k or k in used:
             continue
-        # avoid near-duplicate by prefix overlap
         if any(k[:18] and k[:18] == u[:18] for u in used):
             continue
         used.add(k)
-        picks.append((idx, s, norm))
+        picks.append((idx, s, cleaned))
         if len(picks) >= limit:
             break
     picks.sort(key=lambda x: x[0])
@@ -316,23 +355,39 @@ def _select_representative_sentences(text, limit=6):
 
 
 def _pick_points(text, limit=5):
-    # heuristic "analysis" baseline: select representative points across the talk and condense wording
-    reps = _select_representative_sentences(text, limit=max(limit, 6))
+    # heuristic "analysis" baseline: select representative points across the talk and rewrite as readable points
+    reps = _select_representative_sentences(text, limit=max(limit + 2, 7))
     points, seen = [], set()
     source = reps or _split_sentences(text)
     for s in source:
+        cleaned = _clean_spoken(s)
+        if not _is_complete_enough(cleaned):
+            continue
         key = _sentence_key(s)
         if not key or key in seen:
             continue
-        plain = re.sub(r"[\s\W_]+", "", _normalize_spoken(s) or s, flags=re.UNICODE)
-        if len(plain) < 6:
+        # skip near-duplicates
+        if any(key[:18] and key[:18] == u[:18] for u in seen):
             continue
         seen.add(key)
-        p = _condense_point(s, limit=72)
+        p = _format_point(s, limit=88)
         if p:
             points.append(p)
         if len(points) >= limit:
             break
+    # fallback: if too few, relax completeness constraint
+    if len(points) < min(2, limit):
+        for s in _split_sentences(text):
+            key = _sentence_key(s)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            p = _format_point(s, limit=88)
+            plain = re.sub(r"[\s\W_]+", "", _clean_spoken(s), flags=re.UNICODE)
+            if p and len(plain) >= 8:
+                points.append(p)
+            if len(points) >= limit:
+                break
     return points
 
 
@@ -387,15 +442,15 @@ def make_auto_summary(meeting):
     points = _pick_points(text, limit=5)
     if text:
         # heuristic baseline (not LLM understanding): synthesize a compact overview from representative parts
-        reps = _select_representative_sentences(text, limit=4)
+        reps = _select_representative_sentences(text, limit=5)
         parts = []
         for s in (reps or _split_sentences(text)):
-            c = _condense_point(s, limit=60)
-            if c:
+            c = _format_point(s, limit=56)
+            c = c.rstrip("。…")
+            if c and len(re.sub(r"[\s\W_]+", "", c, flags=re.UNICODE)) >= 8:
                 parts.append(c)
             if len(parts) >= 4:
                 break
-        # de-dup condensed parts
         deduped, seen_k = [], set()
         for p in parts:
             k = re.sub(r"[\s\W_]+", "", p, flags=re.UNICODE)[:24]
@@ -409,7 +464,7 @@ def make_auto_summary(meeting):
             if len(text) > 180:
                 summary_para += "（启发式整理，详见要点与原始转写）"
         else:
-            norm = _normalize_spoken(text)
+            norm = _clean_spoken(text)
             summary_para = (norm[:200] + "…") if len(norm) > 200 else (norm or "（未识别到有效转写内容，请查看原始转写/录音）")
         if len(summary_para) > 320:
             summary_para = summary_para[:318].rstrip() + "…"
