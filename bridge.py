@@ -210,7 +210,8 @@ def extract_transcript_text(transcript_md):
 def _split_sentences(text):
     if not text:
         return []
-    parts = re.split(r"(?<=[。！？!?；;])\s+|\n+", text)
+    # split on newlines and after sentence-ending punctuation (Chinese text often has no space)
+    parts = re.split(r"(?<=[。！？!?；;])\s*|\n+", text)
     out = []
     for p in parts:
         s = re.sub(r"\s+", " ", p).strip(" \t\r\n-•·")
@@ -242,15 +243,30 @@ def _pick_points(text, limit=5):
 def _extract_action_items(text):
     if not text:
         return []
-    keywords = ("需要", "记得", "待办", "TODO", "todo", "下一步", "跟进", "安排", "计划", "补充", "确认", "修复", "处理", "联系", "提交", "发送", "整理")
+    # conservative cues: explicit assignment/reminder/next-step intent; prefer under-extraction over false positives
+    strong_cues = (
+        "待办", "TODO", "todo", "下一步要", "下一步需要", "需要你", "需要我", "需要我们", "请你", "请大家",
+        "记得", "务必", "尽快", "别忘", "麻烦", "负责", "跟进一下", "安排一下", "去确认", "去修复", "去处理",
+    )
+    weak_cues = ("需要", "确认", "修复", "处理", "提交", "发送", "补充", "联系", "安排", "跟进")
     todos, seen = [], set()
     for s in _split_sentences(text):
-        if not any(k in s for k in keywords):
+        has_strong = any(k in s for k in strong_cues)
+        has_weak = any(k in s for k in weak_cues)
+        if not (has_strong or has_weak):
             continue
-        # avoid meta/system phrases
+        # weak cues are easy to false-positive in discussion; require action-oriented phrasing
+        if not has_strong:
+            if not re.search(r"(需要|请|记得|务必|尽快|负责).{0,8}(做|改|修|补|发|提|联|确|处|查|写|测|安|跟)", s):
+                continue
+        # avoid meta/system phrases and pure narration
         if "幂等" in s and "meeting id" in s.lower():
             continue
+        if re.search(r"(已经|已|刚刚|之前).{0,6}(完成|处理|修复|确认)", s):
+            continue
         item = s.strip(" 。！？!?；;")
+        if len(item) < 6:
+            continue
         if len(item) > 60:
             item = item[:58].rstrip() + "…"
         key = re.sub(r"\s+", "", item)
@@ -274,7 +290,28 @@ def make_auto_summary(meeting):
     date_str = dt.strftime("%Y-%m-%d %H:%M（+08:00）") if dt else ""
     points = _pick_points(text, limit=5)
     if text:
-        summary_para = text if len(text) <= 320 else (text[:318].rstrip() + "…")
+        # heuristic extractive baseline (not an LLM understanding summary): keep concise, prefer full sentences
+        if len(text) <= 320:
+            summary_para = text
+        else:
+            picked, total = [], 0
+            for s in _split_sentences(text):
+                seg = s.strip()
+                if not seg:
+                    continue
+                add = len(seg) + (1 if picked else 0)
+                if picked and total + add > 320:
+                    break
+                picked.append(seg)
+                total += add
+                if total >= 260:
+                    break
+            summary_para = " ".join(picked).strip() if picked else text[:318].rstrip()
+            if len(summary_para) > 320:
+                summary_para = summary_para[:318].rstrip() + "…"
+            elif len(summary_para) < len(text):
+                if not summary_para.endswith(("。", "！", "？", "!", "?", "…")):
+                    summary_para += "…"
     else:
         summary_para = "（未识别到有效转写内容，请查看原始转写/录音）"
     todos = _extract_action_items(text)
