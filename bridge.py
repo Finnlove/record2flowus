@@ -201,7 +201,7 @@ def extract_transcript_text(transcript_md):
     m = re.search(r"^##\s*Transcript\s*$", body, re.M | re.I)
     if m:
         body = body[m.end():].strip()
-    cleaned, seen = [], set()
+    cleaned, prev_key = [], ""
     for raw in body.splitlines():
         s = _strip_transcript_prefix(raw)
         if not s:
@@ -210,28 +210,69 @@ def extract_transcript_text(transcript_md):
         if re.fullmatch(r"[-_=*~\s]{3,}", s):
             continue
         key = re.sub(r"\s+", "", s)
-        if key in seen:
+        # skip exact consecutive duplicates
+        if key and key == prev_key:
             continue
-        seen.add(key)
+        prev_key = key or prev_key
         cleaned.append(s)
-    text = "\n".join(cleaned).strip()
-    # collapse excessive whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # ASR chunks are often mid-sentence fragments; merge into continuous flow for better sentence segmentation
+    text = " ".join(cleaned).strip()
+    text = re.sub(r"\s+", " ", text)
     return text
+
+
+def _looks_truncated(s):
+    raw = str(s or "").strip()
+    t = _clean_spoken(s)
+    plain = re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)
+    if not t:
+        return True
+    # explicit ASR-break / incomplete-thought patterns
+    if re.search(r"(?:很多情况下|诸如此类的东西)$", t):
+        return True
+    if re.search(r"(?:整理|描|描述)$", t) and len(plain) <= 60:
+        return True
+    if re.search(r"(?:表现|输入|输出)$", t) and len(plain) <= 60:
+        return True
+    if re.search(r"(?:的|地|得|在|把|被|给|和|与|及|或|对|向|从|到|要|想|去|做|用|来)$", t) and len(plain) < 30:
+        return True
+    # very short fragment with no clear sentence completeness (but allow normal punctuated sentences)
+    if len(plain) < 6 and not re.search(r"[。！？!?；;]$", raw):
+        return True
+    return False
 
 
 def _split_sentences(text):
     if not text:
         return []
-    # split on newlines and after sentence-ending punctuation (Chinese text often has no space)
+    # split after sentence-ending punctuation; keep clauses together for analysis
     parts = re.split(r"(?<=[。！？!?；;])\s*|\n+", text)
-    out = []
+    raw = []
     for p in parts:
         s = re.sub(r"\s+", " ", p).strip(" \t\r\n-•·")
         if not s:
             continue
-        out.append(s)
-    return out
+        raw.append(s)
+    # merge ASR-broken fragments where a segment is clearly truncated
+    merged = []
+    buf = ""
+    for s in raw:
+        cand = (buf + " " + s).strip() if buf else s
+        if _looks_truncated(cand):
+            buf = cand
+            # avoid runaway merge
+            if len(re.sub(r"\s+", "", buf)) > 120:
+                merged.append(buf)
+                buf = ""
+            continue
+        if buf:
+            merged.append(cand)
+            buf = ""
+        else:
+            merged.append(s)
+    if buf:
+        merged.append(buf)
+    return merged if merged else ([re.sub(r"\s+", " ", text).strip()] if text.strip() else [])
 
 
 _FILLER_PHRASES = [
@@ -247,14 +288,31 @@ def _clean_spoken(s):
     # remove standalone filler tokens (keep meaning, avoid over-deleting inside words)
     t = re.sub(r"\b(?:OK|ok)\b[，,\s]*", "", t)
     t = re.sub(r"(?:^|[，,。\s])(?:嗯+|啊+|呃+|哦+|唉+|哈+|呀+|吧|嘛)(?=[，,。\s]|$)", " ", t)
+    # inline fillers in Chinese speech
+    t = re.sub(r"(?:\s+|[，,])(?:嗯+|啊+|呃+|哦+|唉+|哈+|呀)(?:\s+|[，,])", "，", t)
+    t = re.sub(r"(?:嗯+|呃+|哦+|唉+)\s*", "", t)
+    t = re.sub(r"(?<=[\u4e00-\u9fff，,\s])(哈|呢)(?=[，,\s。！？!?])", "", t)
+    t = re.sub(r"([，,])\s*([，,])+", "，", t)
     for p in _FILLER_PHRASES:
         t = t.replace(p, "")
+    # fix common ASR stutters/duplications
+    t = re.sub(r"(不出)说不出", r"\1", t)
+    t = re.sub(r"(说不)说不", r"\1", t)
     t = re.sub(r"\s+", " ", t)
     t = re.sub(r"([，,])\s*([，,])+", "，", t)
     t = re.sub(r"[，,]\s*([。！？!?])", r"\1", t)
     t = t.strip(" \t\r\n-•·，,；;：:")
-    # drop leading dangling conjunctions/punctuation fragments
-    t = re.sub(r"^(?:所以|然后|那么|但是|不过|而且|因为|如果|就是|再一个就是|再一个|还有就是|还有|以及|并且|或者是说|或者)[，,、\s]*", "", t)
+    # drop leading dangling conjunctions/punctuation fragments (iterate for chains)
+    for _ in range(4):
+        nt = re.sub(r"^(?:所以呢|然后呢|那么呢|所以|然后|那么|但是|不过|而且|并且|或者|因为|如果|就是|再一个就是|再一个|还有就是|还有|以及|或者是说|对|好|行|来|去|的实验)[，,、\s]*", "", t)
+        nt = re.sub(r"^(?:的|了|呢|啊|吧|呀|吗|哈)(?=[，,、\s]|$)", "", nt)
+        nt = nt.strip(" \t\r\n-•·，,；;：:")
+        if nt == t:
+            break
+        t = nt
+    # remove trailing dangling particles that often mark broken ASR cuts
+    t = re.sub(r"(?:[，,\s]*(?:啊|呢|嘛|吧|呀|哈))+(?=[。！？!?]|$)", "", t)
+    t = re.sub(r"(?:[，,\s]+(?:啊|呢|嘛|吧|呀|哈))+$", "", t).strip(" \t\r\n-•·，,；;：:")
     t = re.sub(r"\s+", " ", t).strip(" \t\r\n-•·，,；;：:")
     return t
 
@@ -267,13 +325,32 @@ def _sentence_key(s):
 
 def _is_complete_enough(s):
     t = _clean_spoken(s).strip()
-    if len(re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)) < 8:
+    plain = re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)
+    if len(plain) < 8:
         return False
-    # avoid obvious fragments ending with dangling connectors
-    if re.search(r"(的|了|呢|吗|吧|啊|在|把|和|与|及|或|对|给|向|从|到|是)$", t):
-        # short trailing particle can be ok if sentence-like, but be careful
-        if len(t) < 18:
-            return False
+    # reject common broken starts from ASR chunking / clause fragments
+    if re.match(r"^(?:的|了|着|过|得|把|被|是说明|是因为|学\s*school|school\b|等他|再一个|说孩子|咱们现在这个页面)", t):
+        return False
+    # likely fragment if it starts lowercase-mid idea without subject context in Chinese speech patterns
+    if len(plain) < 22 and re.match(r"^(?:咱们|这个页面|正在进行)", t):
+        return False
+    # trailing incompleteness (ends mid-clause or with dangling particles in context)
+    if re.search(r"(?:很多情况下|诸如此类的东西|说的顺畅)$", t):
+        return False
+    if re.search(r"(?:整理|描|表现|输入|输出|转写|总结|描述)$", t) and len(plain) < 60:
+        # often truncated at chunk boundary in ASR
+        return False
+    if re.search(r"(?:的|地|得|了|着|在|把|被|给|和|与|及|或|对|向|从|到|是|有|会|能|要|想|去|做|让|用|跟|比|为|啊|呢|嘛|吧|呀)$", t):
+        return False
+    # reject clearly malformed / duplicated fragments
+    if re.search(r"(不出说不出|说不说不)", t):
+        return False
+    # very short after cleaning is usually fragmentary (but allow clean punctuated statements)
+    if len(plain) < 12 and not re.search(r"[。！？!?；;]$", str(s).strip()):
+        return False
+    # must contain some substantive content cue
+    if not re.search(r"(是|有|能|会|要|想|可以|需要|希望|记录|整理|使用|帮助|提高|做|说|提供|上传|遇到|导致|意识到|觉得|认为|解决|支持|存|传|面对|具备|困难|问题|目的|因为|为了|工具|插件|语音|学习|孩子|模型|讨论|要点|内容|确认|测试|方案|流程|显示)", t):
+        return False
     return True
 
 
@@ -288,22 +365,28 @@ def _format_point(s, limit=88):
     if len(t) > limit:
         window = t[:limit]
         cut = -1
-        for sep in ["。", "！", "？", "；", "，", ",", " "]:
+        for sep in ["。", "！", "？", "；"]:
             idx = window.rfind(sep)
-            if idx >= max(18, limit - 28):
+            if idx >= max(18, limit - 30):
                 cut = idx
                 break
+        if cut <= 0:
+            for sep in ["，", ",", " "]:
+                idx = window.rfind(sep)
+                if idx >= max(24, limit - 24):
+                    cut = idx
+                    break
         if cut > 0:
             t = window[:cut].rstrip(" \t\r\n-•·，,；;：:")
         else:
             t = window.rstrip(" \t\r\n-•·，,；;：:")
         if t and not t.endswith(("。", "！", "？", "…")):
-            t += "…"
+            t += "。"
     else:
         # ensure it reads like a complete point
         if not t.endswith(("。", "！", "？")):
             t += "。"
-    t = re.sub(r"。{2,}", "。", t)
+    t = re.sub(r"[。！？]{2,}。?$", "。", t)
     return t.strip()
 
 
@@ -314,16 +397,23 @@ def _select_representative_sentences(text, limit=6):
     for idx, s in enumerate(sents):
         cleaned = _clean_spoken(s)
         plain = re.sub(r"[\s\W_]+", "", cleaned, flags=re.UNICODE)
-        if len(plain) < 8:
+        if len(plain) < 10:
             continue
-        score = len(plain)
-        if re.search(r"(因为|所以|为了|希望|想要|可以|能够|需要|问题|困难|方法|工具|目的|记录|整理|总结|提高|帮助|使用|插件|语音|转写|归档|学习)", cleaned):
-            score += 10
+        score = min(len(plain), 80)
+        if re.search(r"(因为|所以|为了|希望|想要|可以|能够|需要|问题|困难|方法|工具|目的|记录|整理|总结|提高|帮助|使用|插件|语音|转写|归档|学习|孩子|模型|家长)", cleaned):
+            score += 12
         if _is_complete_enough(cleaned):
-            score += 4
+            score += 8
+        else:
+            score -= 10
+        # penalize obvious fragments
+        if re.search(r"(的|啊|呢|吧)$", cleaned) or re.match(r"^(是说明|是因为|学\b)", cleaned):
+            score -= 12
         scored.append((idx, s, cleaned, score))
     if not scored:
         return []
+    # keep only reasonably good candidates
+    scored = [x for x in scored if x[3] > 0] or sorted(scored, key=lambda x: -x[3])[:limit]
     n = len(scored)
     picks = []
     if n <= limit:
@@ -338,7 +428,7 @@ def _select_representative_sentences(text, limit=6):
         for item in sorted(scored, key=lambda x: (-x[3], x[0])):
             if item not in candidates:
                 candidates.append(item)
-        candidates = sorted(candidates[: limit * 3], key=lambda x: x[0])
+        candidates = sorted(candidates[: limit * 4], key=lambda x: x[0])
     used = set()
     for idx, s, cleaned, _ in candidates:
         k = _sentence_key(s)
@@ -356,12 +446,18 @@ def _select_representative_sentences(text, limit=6):
 
 def _pick_points(text, limit=5):
     # heuristic "analysis" baseline: select representative points across the talk and rewrite as readable points
-    reps = _select_representative_sentences(text, limit=max(limit + 2, 7))
+    reps = _select_representative_sentences(text, limit=max(limit + 3, 8))
     points, seen = [], set()
     source = reps or _split_sentences(text)
     for s in source:
         cleaned = _clean_spoken(s)
         if not _is_complete_enough(cleaned):
+            continue
+        # avoid clause fragments that read broken as standalone points
+        if re.match(r"^(?:是说明|是因为|为了说明)", cleaned):
+            continue
+        plain_c = re.sub(r"[\s\W_]+", "", cleaned, flags=re.UNICODE)
+        if len(plain_c) < 10:
             continue
         key = _sentence_key(s)
         if not key or key in seen:
@@ -375,16 +471,27 @@ def _pick_points(text, limit=5):
             points.append(p)
         if len(points) >= limit:
             break
-    # fallback: if too few, relax completeness constraint
-    if len(points) < min(2, limit):
+    # fallback: if too few, relax completeness constraint but keep basic readability
+    if len(points) < min(3, limit):
         for s in _split_sentences(text):
+            cleaned = _clean_spoken(s)
+            if re.match(r"^(?:是说明|是因为|学\s*school|咱们现在这个页面)", cleaned):
+                continue
             key = _sentence_key(s)
             if not key or key in seen:
                 continue
+            plain = re.sub(r"[\s\W_]+", "", cleaned, flags=re.UNICODE)
+            if len(plain) < 14:
+                continue
+            if re.search(r"(?:很多情况下|诸如此类的东西)$", cleaned):
+                continue
+            if re.search(r"(?:整理|描|表现|输入|输出|记录|转写|总结|描述)$", cleaned) and len(plain) < 60:
+                continue
+            if re.search(r"(?:的|地|得|了|着|在|把|被|给|和|与|及|或|对|向|从|到|是|有|会|能|要|想|去|做|说|让|用|跟|比|为|啊|呢|嘛|吧|呀)$", cleaned):
+                continue
             seen.add(key)
             p = _format_point(s, limit=88)
-            plain = re.sub(r"[\s\W_]+", "", _clean_spoken(s), flags=re.UNICODE)
-            if p and len(plain) >= 8:
+            if p:
                 points.append(p)
             if len(points) >= limit:
                 break
@@ -441,16 +548,27 @@ def make_auto_summary(meeting):
     date_str = dt.strftime("%Y-%m-%d %H:%M（+08:00）") if dt else ""
     points = _pick_points(text, limit=5)
     if text:
-        # heuristic baseline (not LLM understanding): synthesize a compact overview from representative parts
-        reps = _select_representative_sentences(text, limit=5)
+        # heuristic baseline (not LLM understanding): synthesize a compact overview from selected points
         parts = []
-        for s in (reps or _split_sentences(text)):
-            c = _format_point(s, limit=56)
-            c = c.rstrip("。…")
-            if c and len(re.sub(r"[\s\W_]+", "", c, flags=re.UNICODE)) >= 8:
+        for p in points[:4]:
+            c = re.sub(r"[。！？!?…]+$", "", p).strip()
+            c = _clean_spoken(c)
+            if c and len(re.sub(r"[\s\W_]+", "", c, flags=re.UNICODE)) >= 10:
                 parts.append(c)
-            if len(parts) >= 4:
+            if len(parts) >= 3:
                 break
+        if len(parts) < 2:
+            reps = _select_representative_sentences(text, limit=5)
+            for s in (reps or _split_sentences(text)):
+                c = re.sub(r"[。！？!?…]+$", "", _format_point(s, limit=56)).strip()
+                c = _clean_spoken(c)
+                if not c:
+                    continue
+                if re.search(r"(?:很多情况下)$", c) or len(re.sub(r"[\s\W_]+", "", c, flags=re.UNICODE)) < 10:
+                    continue
+                parts.append(c)
+                if len(parts) >= 3:
+                    break
         deduped, seen_k = [], set()
         for p in parts:
             k = re.sub(r"[\s\W_]+", "", p, flags=re.UNICODE)[:24]
