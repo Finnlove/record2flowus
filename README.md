@@ -105,10 +105,11 @@ Notes:
 ### 1) Start the local bridge
 
 ```powershell
+start.cmd                  # recommended: preflight check, then start
+# or
 python bridge.py --check   # validate config without starting
 python bridge.py
-# or
-.\start-bridge.cmd
+.\start-bridge.cmd         # also runs preflight then starts
 ```
 
 The bridge listens on `http://127.0.0.1:27123` by default and exposes authenticated endpoints: `/ping`, `/state`, `/start`, `/stop`, `/reset`. Requests require `Authorization: Bearer <bridge_token>`, valid `Host`, and (for browser calls) the configured allowed extension origin. Startup failures (missing/invalid token, bad config, port in use, etc.) print actionable fixes and point to `setup`/`doctor`.

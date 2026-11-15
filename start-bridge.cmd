@@ -1,5 +1,5 @@
 @echo off
+setlocal
 cd /d "%~dp0"
-echo Starting Hex-FlowUs Voice Note Bridge...
-python "%~dp0bridge.py"
-pause
+call "%~dp0start.cmd"
+if errorlevel 1 pause
