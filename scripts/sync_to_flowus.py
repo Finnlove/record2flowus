@@ -336,6 +336,10 @@ def main():
     ap.add_argument("--archive-id", help="Stable archive id for idempotency marker and remote verification")
     ap.add_argument("--skip-if-present", action="store_true", help="If archive marker already exists on target page, skip writes")
     ap.add_argument("--work-dir", help="Directory for temporary request payload files (unique per run recommended)")
+    ap.add_argument("--reuse-upload-oss-name", help="Reuse previously uploaded audio oss_name to avoid duplicate upload")
+    ap.add_argument("--reuse-upload-size", type=int, default=0, help="Size for reused upload")
+    ap.add_argument("--reuse-mindmap-id", help="Reuse previously created mindmap id")
+    ap.add_argument("--reuse-mindmap-url", help="Reuse previously created mindmap url")
     args = ap.parse_args()
 
     work_dir = args.work_dir or make_tmp_dir("vn_sync")
@@ -386,28 +390,35 @@ def main():
         page_created = True
         print("PAGE_OK", page_id, page_url)
 
-    # Best-effort remote idempotency check (append target known)
-    if args.archive_id and args.skip_if_present:
+    # Strict-ish remote idempotency check (append target known): if marker exists, skip writes
+    if args.archive_id and args.skip_if_present and args.page_id:
         found, where = page_contains_marker(page_id, args.archive_id)
         if found:
             print("SKIP_ALREADY_ARCHIVED", args.archive_id, where or "")
             print(json.dumps({"ok": True, "skipped": True, "reason": "marker_present", "archive_id": args.archive_id,
-                              "page_id": page_id, "page_url": page_url, "meeting_id": meeting["id"]}, ensure_ascii=False))
+                              "page_id": page_id, "page_url": page_url, "meeting_id": meeting["id"], "marker_verified": True}, ensure_ascii=False))
             return
-        # if check inconclusive (where is dict/error), we proceed cautiously (no false-skip)
+        # inconclusive check (network/read error): proceed cautiously (no false-skip), but caller may treat uncertainty separately if needed.
 
-    # Upload audio
-    up, ok = run_flowus_ok(["--json", "file", "upload", "--parent-page", page_id, meeting["wav"]])
-    if not ok:
-        print(json.dumps(up, ensure_ascii=False, indent=2)); sys.exit(1)
-    oss_name = up["data"]["oss_name"]
-    size = up["data"].get("size", 0)
-    print("UPLOAD_OK", oss_name, size)
+    # Upload audio (or reuse from a previous partial attempt)
+    if args.reuse_upload_oss_name:
+        oss_name = args.reuse_upload_oss_name
+        size = int(args.reuse_upload_size or 0)
+        print("UPLOAD_REUSE", oss_name, size)
+    else:
+        up, ok = run_flowus_ok(["--json", "file", "upload", "--parent-page", page_id, meeting["wav"]])
+        if not ok:
+            print(json.dumps(up, ensure_ascii=False, indent=2)); sys.exit(1)
+        oss_name = up["data"]["oss_name"]
+        size = up["data"].get("size", 0)
+        print("UPLOAD_OK", oss_name, size)
 
-    # Mindmap (optional)
-    mindmap_url = None
-    mindmap_id = None
-    if (not args.no_mindmap) and args.mindmap_json and os.path.isfile(args.mindmap_json):
+    # Mindmap (optional, or reuse)
+    mindmap_url = args.reuse_mindmap_url or None
+    mindmap_id = args.reuse_mindmap_id or None
+    if mindmap_id or mindmap_url:
+        print("MINDMAP_REUSE", mindmap_id or "", mindmap_url or "")
+    elif (not args.no_mindmap) and args.mindmap_json and os.path.isfile(args.mindmap_json):
         with open(args.mindmap_json, "r", encoding="utf-8") as f:
             mm_body = json.load(f)
         mm_body["parent"] = {"page_id": page_id}

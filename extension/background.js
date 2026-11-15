@@ -138,6 +138,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (msg.type === "start") return await bridge("/start", "POST", msg.payload || {});
       if (msg.type === "stop") return await bridge("/stop", "POST", {});
       if (msg.type === "reset") return await bridge("/reset", "POST", {});
+      if (msg.type === "retry") return await bridge("/retry", "POST", msg.payload || {});
+      if (msg.type === "archives") return await bridge("/archives", "GET");
       throw new Error("unknown message");
     } catch (e) {
       const info = classifyBridgeError(e, e && e.status, e && e.data && e.data.error);

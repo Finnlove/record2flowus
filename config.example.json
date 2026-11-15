@@ -5,5 +5,10 @@
   "bridge_port": 27123,
   "sync_script": "scripts/sync_to_flowus.py",
   "bridge_token": "REPLACE_WITH_A_RANDOM_TOKEN_AT_LEAST_32_CHARS",
-  "bridge_allowed_origin": "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID"
+  "bridge_allowed_origin": "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID",
+  "summary_mode": "rules",
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "qwen2.5:7b",
+  "ollama_timeout": 90,
+  "archive_artifacts_dir": ""
 }

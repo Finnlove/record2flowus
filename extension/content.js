@@ -226,9 +226,10 @@
       btn.title = "语音笔记 - " + hint;
       showTip(hint, false);
     } else if (s === "error") {
-      btn.textContent = "⚠";
+      btn.textContent = (st && st.can_retry) ? "↻" : "⚠";
       btn.classList.add("fvn-err");
-      const hint = "失败：" + (err || msg || "未知错误");
+      const retryHint = (st && st.can_retry) ? "（点击重试归档）" : "";
+      const hint = "失败：" + (err || msg || "未知错误") + retryHint;
       btn.title = "语音笔记 - " + hint;
       showTip(hint, true);
     } else {
@@ -258,8 +259,8 @@
     const res = await send("state");
     const st = res && res.ok ? res.state : { status: "idle" };
     const s = st.status || "idle";
-    if (s === "idle" || s === "done" || s === "error") {
-      if (s === "done" || s === "error") await send("reset");
+    if (s === "idle" || s === "done") {
+      if (s === "done") await send("reset");
       const pageId = getPageId();
       if (!pageId) {
         setUI({ status: "error", error: "未识别到当前 FlowUs 页面 ID，请在具体页面上使用" });
@@ -268,6 +269,22 @@
       setUI({ status: "starting", message: "正在唤起 Hex 录音…" });
       const r = await send("start", { pageId, url: location.href, title: document.title || "" });
       if (!r || !r.ok) setUI({ status: "error", error: formatError(r, "启动失败") });
+    } else if (s === "error") {
+      if (st.can_retry) {
+        setUI({ status: "processing", message: "正在重试归档…" });
+        const r = await send("retry", { archive_id: st.archive_id, meeting_id: st.meeting_id, page_id: getPageId() });
+        if (!r || !r.ok) setUI({ status: "error", error: formatError(r, "重试失败"), can_retry: true, archive_id: st.archive_id });
+      } else {
+        await send("reset");
+        const pageId = getPageId();
+        if (!pageId) {
+          setUI({ status: "error", error: "未识别到当前 FlowUs 页面 ID，请在具体页面上使用" });
+          return;
+        }
+        setUI({ status: "starting", message: "正在唤起 Hex 录音…" });
+        const r = await send("start", { pageId, url: location.href, title: document.title || "" });
+        if (!r || !r.ok) setUI({ status: "error", error: formatError(r, "启动失败") });
+      }
     } else if (s === "recording" || s === "starting") {
       setUI({ status: "stopping", message: "停止并整理上传…" });
       const r = await send("stop");

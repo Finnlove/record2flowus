@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS archives (
 );
 CREATE INDEX IF NOT EXISTS idx_archives_meeting ON archives(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_archives_status ON archives(status);
+CREATE INDEX IF NOT EXISTS idx_archives_meeting_target ON archives(meeting_id, target_page_id);
 """
 
 
@@ -75,6 +76,22 @@ class ArchiveStore:
             row = conn.execute("SELECT * FROM archives WHERE archive_id=?", (archive_id,)).fetchone()
             return dict(row) if row else None
 
+    def find_by_meeting_page(self, meeting_id, target_page_id):
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM archives WHERE meeting_id=? AND target_page_id=? ORDER BY updated_at DESC LIMIT 1",
+                (str(meeting_id or ""), str(target_page_id or "")),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_retryable(self, limit=50):
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM archives WHERE status IN ('error','needs_review') ORDER BY updated_at DESC LIMIT ?",
+                (int(limit or 50),),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
     def get_steps(self, archive_id):
         rec = self.get(archive_id)
         if not rec:
@@ -103,7 +120,7 @@ class ArchiveStore:
                 )
             conn.execute("COMMIT")
 
-    def claim(self, archive_id, meeting_id, target_page_id=None, worker_id=None, stale_after_sec=7200):
+    def claim(self, archive_id, meeting_id, target_page_id=None, worker_id=None, stale_after_sec=7200, allow_review_retry=False):
         now = self._now()
         worker_id = worker_id or str(uuid.uuid4())
         with self._lock, self._connect() as conn:
@@ -132,7 +149,7 @@ class ArchiveStore:
                     return {"ok": False, "reason": "already_running", "status": status, "claimed_by": row["claimed_by"]}
                 # stale claim: allow takeover
 
-            if status == "needs_review":
+            if status == "needs_review" and not allow_review_retry:
                 conn.execute("COMMIT")
                 return {"ok": False, "reason": "needs_review", "status": status, "record": dict(row)}
 
@@ -187,6 +204,15 @@ class ArchiveStore:
             conn.execute(
                 "UPDATE archives SET status='needs_review', error=?, result_json=?, updated_at=?, claimed_by=NULL WHERE archive_id=?",
                 (str(error)[:4000], json.dumps(result or {}, ensure_ascii=False), now, archive_id),
+            )
+
+    def mark_retry_pending(self, archive_id):
+        # allow explicit retry after error/needs_review while preserving steps/result for audit
+        now = self._now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE archives SET status='pending', error=NULL, claimed_by=NULL, claim_at=NULL, updated_at=? WHERE archive_id=?",
+                (now, archive_id),
             )
 
     def release(self, archive_id, status="pending"):

@@ -74,11 +74,18 @@ Key settings (`config.local.json`):
   "bridge_port": 27123,
   "sync_script": "scripts/sync_to_flowus.py",
   "bridge_token": "<RANDOM_TOKEN_32+_CHARS>",
-  "bridge_allowed_origin": "chrome-extension://<EXTENSION_ID>"
+  "bridge_allowed_origin": "chrome-extension://<EXTENSION_ID>",
+  "summary_mode": "rules",
+  "ollama_url": "http://127.0.0.1:11434",
+  "ollama_model": "qwen2.5:7b",
+  "ollama_timeout": 90,
+  "archive_artifacts_dir": ""
 }
 ```
 - **`bridge_token` (required):** high-entropy random secret (>= 32 chars). Must match the extension Options value.
 - **`bridge_allowed_origin` (required for browser use):** must match the loaded extension origin; restart bridge after changes.
+- **`summary_mode` (optional):** `rules` (default, heuristic) or `ollama` (local LLM via Ollama). When `ollama` is selected, the bridge calls `ollama_url`/`ollama_model` and **falls back to rules on failure**.
+- **`archive_artifacts_dir` (optional):** persistent directory for generated summary/mindmap artifacts and retry context (default: `%APPDATA%/hex-flowus-voice-note/artifacts`).
 - Bridge binds to `127.0.0.1` only and validates Host/Origin, auth, and request inputs.
 - Config parse errors stop startup with explicit file/reason. Do **not** commit `config.json`/`config.local.json`.
 
@@ -94,7 +101,7 @@ start.cmd                  # recommended: preflight check, then start
 python bridge.py --check   # validate config without starting
 python bridge.py
 ```
-Authenticated endpoints: `/ping`, `/state`, `/start`, `/stop`, `/reset` (loopback only). Keep it running during use.
+Authenticated endpoints: `/ping`, `/state`, `/start`, `/stop`, `/retry`, `/archives`, `/reset` (loopback only). Keep it running during use.
 
 (Optional auto-start) copy `start-bridge-silent.vbs.example` to `start-bridge-silent.vbs`, adjust if needed, and place in `shell:startup`.
 
@@ -121,13 +128,21 @@ Useful options: `--meeting-id`, `--meetings-dir`, `--summary-file`, `--mindmap-j
 
 ---
 
+## Recovery & retry
+
+- Failed/uncertain archives are recorded in a local SQLite ledger (`%APPDATA%/hex-flowus-voice-note/archive_ledger.sqlite3`) with step/status and preserved generated artifacts for retry.
+- **Extension:** when an archive fails and is retryable, the button shows a retry state — click to re-run the archive. If a write was uncertain, review the target page before retrying.
+- **Bridge API:** `POST /retry` (authenticated) retries the latest/current retryable archive (or a specified `archive_id`).
+- **CLI:** `python scripts/retry_archive.py --list` / `python scripts/retry_archive.py [--archive-id ...]` (or `--call-bridge`).
+- Source Hex artifacts remain in the Hex meetings directory; generated summaries/mindmaps are kept in the archive artifacts directory until you choose to clean them.
+
 ## Troubleshooting
 
 - Run `doctor.cmd` and `python bridge.py --check`.
 - Use extension Options **Test connection**.
 - See **[docs/troubleshooting.md](docs/troubleshooting.md)** for symptoms, causes, and fixes.
 
-**Data safety note:** local Hex audio/transcripts are primary assets. If upload/append fails, keep local artifacts until resolved (retry/idempotency tooling planned in M3).
+**Data safety note:** local Hex audio/transcripts are primary assets. Retries are best-effort and duplicate side effects (e.g. re-uploads) are minimized where possible, but uncertain partial writes may still require manual review.
 
 ---
 
@@ -138,6 +153,9 @@ Useful options: `--meeting-id`, `--meetings-dir`, `--summary-file`, `--mindmap-j
 ├─ extension/                 # Browser extension (MV3) + Options/Test connection
 ├─ scripts/
 │  ├─ sync_to_flowus.py       # Hex artifacts → FlowUs (beautified)
+│  ├─ archive_store.py        # Local archive ledger (idempotency/retry state)
+│  ├─ summarizer.py           # Summary modes (rules / Ollama) with fallback
+│  ├─ retry_archive.py        # Retry failed/needs-review archives
 │  ├─ doctor.py               # Preflight diagnostics
 │  └─ setup.py                # Config bootstrap wizard
 ├─ docs/
@@ -167,9 +185,9 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 ## Limitations
 
-- Baseline summarization/mind-map generation is heuristic (pluggable).
-- No built-in idempotency/dedup by meeting ID yet (retries may duplicate appends).
-- Recovery/retry for interrupted runs and upload failures is planned (M3); preserve local artifacts.
+- Summarization/mind-map generation is heuristic by default; optional local Ollama mode is supported (`summary_mode=ollama`) with automatic fallback to rules.
+- Idempotency/dedup is **best-effort**: archives are keyed by meeting+target page in a local ledger and verified via a remote archive marker before writes (skip if already present). FlowUs has no server-side idempotency keys and "update existing blocks" is not supported, so uncertain partial writes may still require manual review.
+- Recovery/retry is supported (ledger + preserved artifacts + `/retry`/CLI/extension), but fine-grained resume of every remote side effect is not guaranteed.
 - Bridge depends on local Hex/FlowUs CLI behavior and availability.
 - Extension cannot spawn the bridge process by itself.
 
@@ -184,7 +202,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 - **M1 (`v0.2.0-milestone`):** core workflow, security hardening, E2E verified.
 - **M2 (in progress):** onboarding/productization — doctor/setup, diagnostics UX, quickstart docs, stranger first-archive validation. See [docs/milestone-2-productization.md](docs/milestone-2-productization.md).
-- **M3:** stability, recovery, idempotency, data/temp management, tests.
+- **M3 (in progress):** best-effort idempotency/dedup, recovery/retry, artifact retention, summary mode pluggability, tests (further hardening ongoing).
 - **M4:** UX polish and release packaging.
 
 ## Contributors

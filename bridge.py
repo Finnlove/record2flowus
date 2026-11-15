@@ -2,6 +2,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,10 @@ except Exception:
     ArchiveStore = None
     make_archive_id = None
     default_db_path = None
+try:
+    from scripts.summarizer import generate_summary
+except Exception:
+    generate_summary = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_BODY_SIZE = 8 * 1024
@@ -80,6 +85,13 @@ ALLOWED_ORIGIN = str(os.environ.get("BRIDGE_ALLOWED_ORIGIN") or CFG.get("bridge_
 EXPECTED_HOST = f"127.0.0.1:{PORT}"
 LEDGER_DB = os.environ.get("ARCHIVE_LEDGER_DB") or CFG.get("archive_ledger_db") or (default_db_path() if default_db_path else "")
 LEDGER = ArchiveStore(LEDGER_DB) if (ArchiveStore and LEDGER_DB) else None
+ARCHIVE_ARTIFACTS_DIR = os.environ.get("ARCHIVE_ARTIFACTS_DIR") or CFG.get("archive_artifacts_dir") or os.path.join(os.environ.get("APPDATA", "") or os.path.expanduser("~"), "hex-flowus-voice-note", "artifacts")
+SUMMARY_CFG = {
+    "summary_mode": CFG.get("summary_mode") or "rules",
+    "ollama_url": CFG.get("ollama_url"),
+    "ollama_model": CFG.get("ollama_model"),
+    "ollama_timeout": CFG.get("ollama_timeout"),
+}
 
 state = {
     "status": "idle",  # idle|starting|recording|stopping|processing|done|error
@@ -670,20 +682,134 @@ def detect_new_meeting(before_ids, timeout_s=20):
     return None
 
 
-def process_and_upload(meeting_id, page_id, archive_id=None):
+def _job_dir(archive_id):
+    safe = re.sub(r"[^A-Za-z0-9._:-]+", "_", str(archive_id or "job"))[:180]
+    d = os.path.join(ARCHIVE_ARTIFACTS_DIR, safe)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_json(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def _read_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _prepare_job_artifacts(meeting_id, archive_id, page_id, page_url=None, page_title=None, force_regen=False):
     meeting = load_meeting_artifacts(meeting_id)
-    summary_md, points = make_auto_summary(meeting)
+    job_dir = _job_dir(archive_id)
+    meta_path = os.path.join(job_dir, "job.json")
+    sum_path = os.path.join(job_dir, "summary.md")
+    mm_path = os.path.join(job_dir, "mindmap.json")
+    summary_meta_path = os.path.join(job_dir, "summary_meta.json")
+
+    if (not force_regen) and os.path.isfile(sum_path) and os.path.isfile(mm_path) and os.path.isfile(meta_path):
+        try:
+            meta = _read_json(meta_path)
+            # reuse if bound to same meeting/archive/page
+            if str(meta.get("meeting_id")) == str(meeting_id) and str(meta.get("archive_id")) == str(archive_id):
+                if os.path.isfile(summary_meta_path):
+                    meta["summary_meta"] = _read_json(summary_meta_path)
+                return meeting, job_dir, sum_path, mm_path, meta
+        except Exception:
+            pass
+
+    text = extract_transcript_text(meeting.get("transcript") or "")
+    if generate_summary is not None:
+        sres = generate_summary(meeting, text, cfg=SUMMARY_CFG, make_auto_summary_fn=make_auto_summary)
+    else:
+        summary_md, pts = make_auto_summary(meeting)
+        sres = {"ok": True, "mode": "rules", "summary_md": summary_md, "points": pts or [], "fallback": False}
+
+    summary_md = sres.get("summary_md") or ""
+    points = sres.get("points") or []
+    # if model result lacked valid structure, fall back
+    if not summary_md.strip():
+        summary_md, points = make_auto_summary(meeting)
+        sres = {"ok": True, "mode": "rules", "summary_md": summary_md, "points": points or [], "fallback": True, "fallback_reason": "empty_summary"}
+
     mm_body = make_auto_mindmap(meeting, points)
-    # per-run isolated temp workspace
-    run_id = (archive_id or meeting_id or "run").replace(":", "_").replace("/", "_")
-    tmp = os.path.join(tempfile.gettempdir(), "hex-flowus-voice-note", run_id + "_" + uuid.uuid4().hex[:8])
-    os.makedirs(tmp, exist_ok=True)
-    sum_path = os.path.join(tmp, f"auto_summary_{meeting_id}.md")
-    mm_path = os.path.join(tmp, f"auto_mindmap_{meeting_id}.json")
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write(summary_md)
     with open(mm_path, "w", encoding="utf-8") as f:
         json.dump(mm_body, f, ensure_ascii=False)
+
+    meta = {
+        "archive_id": archive_id,
+        "meeting_id": meeting_id,
+        "page_id": page_id,
+        "page_url": page_url,
+        "page_title": page_title,
+        "created_at": time.time(),
+        "summary_mode": sres.get("mode"),
+        "summary_fallback": bool(sres.get("fallback")),
+        "summary_fallback_reason": sres.get("fallback_reason"),
+        "summary_model": sres.get("model"),
+    }
+    _write_json(meta_path, meta)
+    _write_json(summary_meta_path, {k: sres.get(k) for k in ("mode", "fallback", "fallback_reason", "requested_mode", "model") if k in sres})
+    meta["summary_meta"] = _read_json(summary_meta_path)
+    return meeting, job_dir, sum_path, mm_path, meta
+
+
+def _ledger_retry_context(archive_id):
+    if not LEDGER or not archive_id:
+        return {}
+    try:
+        rec = LEDGER.get(archive_id) or {}
+        steps = LEDGER.get_steps(archive_id) or {}
+        result = {}
+        try:
+            result = json.loads(rec.get("result_json") or "{}") or {}
+        except Exception:
+            result = {}
+        ctx = {}
+        audio = (steps.get("upload") or {}) if isinstance(steps.get("upload"), dict) else {}
+        if not audio and isinstance(result.get("audio"), dict):
+            audio = result.get("audio")
+        if audio.get("oss_name"):
+            ctx["reuse_upload_oss_name"] = audio.get("oss_name")
+            ctx["reuse_upload_size"] = audio.get("size") or 0
+        mm = (steps.get("mindmap") or {}) if isinstance(steps.get("mindmap"), dict) else {}
+        if not mm.get("id") and result.get("mindmap_id"):
+            mm = {"id": result.get("mindmap_id"), "url": result.get("mindmap_url")}
+        if mm.get("id") or mm.get("url"):
+            ctx["reuse_mindmap_id"] = mm.get("id")
+            ctx["reuse_mindmap_url"] = mm.get("url")
+        ctx["steps"] = steps
+        ctx["record"] = rec
+        return ctx
+    except Exception:
+        return {}
+
+
+def process_and_upload(meeting_id, page_id, archive_id=None, page_url=None, page_title=None, retry=False):
+    if archive_id:
+        meeting, job_dir, sum_path, mm_path, job_meta = _prepare_job_artifacts(
+            meeting_id, archive_id, page_id, page_url=page_url, page_title=page_title, force_regen=False
+        )
+    else:
+        meeting = load_meeting_artifacts(meeting_id)
+        job_dir = os.path.join(tempfile.gettempdir(), "hex-flowus-voice-note", (meeting_id or "run") + "_" + uuid.uuid4().hex[:8])
+        os.makedirs(job_dir, exist_ok=True)
+        sum_path = os.path.join(job_dir, f"auto_summary_{meeting_id}.md")
+        mm_path = os.path.join(job_dir, f"auto_mindmap_{meeting_id}.json")
+        summary_md, points = make_auto_summary(meeting)
+        with open(sum_path, "w", encoding="utf-8") as f:
+            f.write(summary_md)
+        with open(mm_path, "w", encoding="utf-8") as f:
+            json.dump(make_auto_mindmap(meeting, points), f, ensure_ascii=False)
+        job_meta = {}
+
+    # per-run isolated temp workspace for sync payloads
+    run_tag = (archive_id or meeting_id or "run").replace(":", "_").replace("/", "_")
+    tmp = os.path.join(job_dir, "runs", time.strftime("%Y%m%d-%H%M%S") + "_" + uuid.uuid4().hex[:6])
+    os.makedirs(tmp, exist_ok=True)
+
     if not os.path.isfile(SYNC_SCRIPT):
         raise RuntimeError(f"sync script not found: {SYNC_SCRIPT}")
 
@@ -693,8 +819,23 @@ def process_and_upload(meeting_id, page_id, archive_id=None):
     if archive_id:
         cmd += ["--archive-id", archive_id, "--skip-if-present"]
 
+    # On retry, reuse known successful side-effect artifacts when available to reduce duplicates
+    if retry and archive_id:
+        rctx = _ledger_retry_context(archive_id)
+        if rctx.get("reuse_upload_oss_name"):
+            cmd += ["--reuse-upload-oss-name", str(rctx["reuse_upload_oss_name"]), "--reuse-upload-size", str(int(rctx.get("reuse_upload_size") or 0))]
+        if rctx.get("reuse_mindmap_id") or rctx.get("reuse_mindmap_url"):
+            if rctx.get("reuse_mindmap_id"):
+                cmd += ["--reuse-mindmap-id", str(rctx["reuse_mindmap_id"])]
+            if rctx.get("reuse_mindmap_url"):
+                cmd += ["--reuse-mindmap-url", str(rctx["reuse_mindmap_url"])]
+
     if LEDGER and archive_id:
-        LEDGER.update_steps(archive_id, {"prepare": {"ok": True, "work_dir": tmp}, "sync_started": {"ts": time.time()}})
+        LEDGER.update_steps(archive_id, {
+            "prepare": {"ok": True, "job_dir": job_dir, "work_dir": tmp, "summary_mode": job_meta.get("summary_mode")},
+            "context": {"page_id": page_id, "page_url": page_url, "page_title": page_title, "meeting_id": meeting_id},
+            "sync_started": {"ts": time.time(), "retry": bool(retry)},
+        })
 
     r = run(cmd, timeout=600)
     out = (r.stdout or "") + "\n" + (r.stderr or "")
@@ -711,7 +852,7 @@ def process_and_upload(meeting_id, page_id, archive_id=None):
     # classify result
     if result and result.get("skipped") and result.get("reason") == "marker_present":
         if LEDGER and archive_id:
-            LEDGER.update_steps(archive_id, {"remote_marker": {"present": True}, "sync": {"skipped": True}})
+            LEDGER.update_steps(archive_id, {"remote_marker": {"present": True, "where": result.get("marker_verified") or True}, "sync": {"skipped": True}})
         return {"ok": True, "skipped": True, "archive_id": archive_id, "result": result}
 
     if r.returncode == 0 and result and result.get("ok"):
@@ -721,14 +862,20 @@ def process_and_upload(meeting_id, page_id, archive_id=None):
                 "mindmap": {"id": result.get("mindmap_id"), "url": result.get("mindmap_url")},
                 "append": {"ok": True},
                 "verify": {"marker_verified": result.get("marker_verified")},
-                "sync": {"ok": True},
+                "sync": {"ok": True, "retry": bool(retry)},
             })
         return result
 
     # uncertain cases: append failed mid-way or process interrupted after partial writes
     uncertain = bool(result and (result.get("uncertain") or result.get("step") == "append"))
     if LEDGER and archive_id:
-        LEDGER.update_steps(archive_id, {"sync": {"ok": False, "uncertain": uncertain, "returncode": r.returncode, "tail": out[-1500:]}})
+        step_patch = {"sync": {"ok": False, "uncertain": uncertain, "returncode": r.returncode, "tail": out[-1500:], "retry": bool(retry)}}
+        # capture partial outputs if present for future retry reuse
+        if result and isinstance(result.get("audio"), dict):
+            step_patch["upload"] = result.get("audio")
+        if result and (result.get("mindmap_id") or result.get("mindmap_url")):
+            step_patch["mindmap"] = {"id": result.get("mindmap_id"), "url": result.get("mindmap_url")}
+        LEDGER.update_steps(archive_id, step_patch)
     err = RuntimeError(out[-2000:] or "sync failed")
     setattr(err, "uncertain", uncertain)
     setattr(err, "result", result)
@@ -771,6 +918,8 @@ def worker_stop_and_process():
         with lock:
             mid = state.get("meeting_id")
             page_id = state.get("page_id")
+            page_url = state.get("page_url")
+            page_title = state.get("page_title")
             state.update({"status": "stopping", "message": "stopping recording"})
         hex_cmd(["meetings", "stop", "--json"], timeout=60)
         if not mid:
@@ -793,25 +942,37 @@ def worker_stop_and_process():
         # idempotency: archive identity per meeting+target page (append mode)
         if make_archive_id:
             archive_id = make_archive_id(mid, page_id, mode="append")
+
+        # strict local dedupe by meeting+page: if any done record exists for same pair, skip
         if LEDGER and archive_id:
+            existing = LEDGER.find_by_meeting_page(mid, page_id)
+            if existing and existing.get("status") == "done" and existing.get("archive_id") != archive_id:
+                # different archive_id should not happen for same pair, but be safe
+                with lock:
+                    state.update({"status": "done", "message": "already archived (skipped)", "archive_id": existing.get("archive_id"),
+                                  "result": {"ok": True, "skipped": True, "reason": "local_done", "archive_id": existing.get("archive_id")}})
+                return
+
             claim = LEDGER.claim(archive_id, mid, target_page_id=page_id)
             if not claim.get("ok"):
                 reason = claim.get("reason")
+                rec = claim.get("record") or {}
                 if reason == "already_done":
                     with lock:
-                        state.update({"status": "done", "message": "already archived (skipped)", "result": {"ok": True, "skipped": True, "reason": reason, "archive_id": archive_id}})
+                        state.update({"status": "done", "message": "already archived (skipped)", "archive_id": archive_id,
+                                      "result": {"ok": True, "skipped": True, "reason": reason, "archive_id": archive_id}})
                     return
                 if reason == "needs_review":
                     with lock:
-                        state.update({"status": "error", "error": "archive needs review before retry (possible prior partial write)", "message": "needs review"})
+                        state.update({"status": "error", "message": "needs review", "archive_id": archive_id,
+                                      "error": "archive needs review before retry (possible prior partial write)"})
                     return
                 if reason == "already_running":
                     with lock:
-                        state.update({"status": "error", "error": "same archive is already running", "message": "busy"})
+                        state.update({"status": "error", "error": "same archive is already running", "message": "busy", "archive_id": archive_id})
                     return
-                # default: treat as non-runnable
                 with lock:
-                    state.update({"status": "error", "error": f"archive claim rejected: {reason}", "message": "busy"})
+                    state.update({"status": "error", "error": f"archive claim rejected: {reason}", "message": "busy", "archive_id": archive_id})
                 return
             claim_worker = claim.get("worker_id")
 
@@ -820,7 +981,7 @@ def worker_stop_and_process():
             if archive_id:
                 state["archive_id"] = archive_id
 
-        result = process_and_upload(mid, page_id, archive_id=archive_id)
+        result = process_and_upload(mid, page_id, archive_id=archive_id, page_url=page_url, page_title=page_title, retry=False)
         with lock:
             state.update({"status": "done", "message": "uploaded", "result": result})
         if LEDGER and archive_id:
@@ -834,9 +995,82 @@ def worker_stop_and_process():
                 LEDGER.mark_error(archive_id, str(e))
         with lock:
             if uncertain:
-                state.update({"status": "error", "error": "write result uncertain; manual review required before retry: " + str(e), "message": "needs review"})
+                state.update({"status": "error", "error": "write result uncertain; manual review required before retry: " + str(e),
+                              "message": "needs review", "archive_id": archive_id})
             else:
-                state.update({"status": "error", "error": str(e), "message": "processing failed"})
+                state.update({"status": "error", "error": str(e), "message": "processing failed", "archive_id": archive_id})
+
+
+def worker_retry_archive(archive_id=None, meeting_id=None, page_id=None):
+    try:
+        with lock:
+            state.update({"status": "processing", "message": "retrying archive", "error": None, "result": None})
+
+        if not LEDGER:
+            raise RuntimeError("archive ledger unavailable")
+
+        rec = None
+        if archive_id:
+            rec = LEDGER.get(archive_id)
+        elif meeting_id and page_id:
+            rec = LEDGER.find_by_meeting_page(meeting_id, page_id)
+            if rec:
+                archive_id = rec.get("archive_id")
+        else:
+            raise RuntimeError("archive_id or (meeting_id,page_id) required")
+
+        if not rec:
+            raise RuntimeError("archive record not found")
+        archive_id = rec.get("archive_id") or archive_id
+        meeting_id = rec.get("meeting_id") or meeting_id
+        page_id = rec.get("target_page_id") or page_id
+        if not meeting_id or not page_id or not archive_id:
+            raise RuntimeError("archive record missing meeting/page id")
+
+        steps = LEDGER.get_steps(archive_id) or {}
+        ctx = steps.get("context") if isinstance(steps.get("context"), dict) else {}
+        page_url = ctx.get("page_url") or state.get("page_url")
+        page_title = ctx.get("page_title") or state.get("page_title")
+
+        # for explicit retry, allow transition from needs_review/error
+        if rec.get("status") == "needs_review":
+            LEDGER.mark_retry_pending(archive_id)
+
+        claim = LEDGER.claim(archive_id, meeting_id, target_page_id=page_id, allow_review_retry=True)
+        if not claim.get("ok"):
+            reason = claim.get("reason")
+            if reason == "already_done":
+                with lock:
+                    state.update({"status": "done", "message": "already archived (skipped)", "archive_id": archive_id,
+                                  "result": {"ok": True, "skipped": True, "reason": "already_done", "archive_id": archive_id}})
+                return
+            raise RuntimeError(f"cannot retry archive: {reason}")
+
+        with lock:
+            state.update({"meeting_id": meeting_id, "page_id": page_id, "archive_id": archive_id, "message": "uploading to FlowUs (retry)"})
+
+        result = process_and_upload(meeting_id, page_id, archive_id=archive_id, page_url=page_url, page_title=page_title, retry=True)
+        with lock:
+            state.update({"status": "done", "message": "uploaded", "result": result})
+        LEDGER.mark_done(archive_id, result=result)
+    except Exception as e:
+        uncertain = bool(getattr(e, "uncertain", False))
+        try:
+            if LEDGER and (archive_id or (meeting_id and page_id)):
+                aid = archive_id or (make_archive_id(meeting_id, page_id, mode="append") if make_archive_id and meeting_id and page_id else None)
+                if aid:
+                    if uncertain:
+                        LEDGER.mark_needs_review(aid, str(e), result=getattr(e, "result", None))
+                    else:
+                        LEDGER.mark_error(aid, str(e))
+        except Exception:
+            pass
+        with lock:
+            if uncertain:
+                state.update({"status": "error", "error": "write result uncertain; manual review required before retry: " + str(e),
+                              "message": "needs review", "archive_id": archive_id})
+            else:
+                state.update({"status": "error", "error": str(e), "message": "retry failed", "archive_id": archive_id})
 
 
 def _is_flowus_url(url):
@@ -863,11 +1097,19 @@ def _public_state():
             "message": state.get("message") or "",
             "has_error": bool(state.get("error")),
             "page_bound": bool(state.get("page_id")),
+            "can_retry": False,
         }
         if state.get("archive_id"):
             st["archive_id"] = state.get("archive_id")
-        if state.get("meeting_id") and state.get("status") in ("recording", "stopping", "processing", "done"):
-            st["meeting_bound"] = True
+        if state.get("meeting_id"):
+            st["meeting_id"] = state.get("meeting_id")
+        if state.get("status") == "error" and state.get("archive_id") and LEDGER:
+            try:
+                rec = LEDGER.get(state.get("archive_id")) or {}
+                st["can_retry"] = rec.get("status") in ("error", "needs_review", "pending")
+                st["archive_status"] = rec.get("status")
+            except Exception:
+                st["can_retry"] = True
         return st
 
 
@@ -1043,6 +1285,48 @@ class Handler(BaseHTTPRequestHandler):
                     return
             threading.Thread(target=worker_stop_and_process, daemon=True).start()
             self._send(200, {"ok": True})
+
+        elif path == "/retry":
+            with lock:
+                if state.get("status") in ("recording", "stopping", "processing", "starting"):
+                    self._send(409, {"ok": False, "error": "busy", "state": _public_state()})
+                    return
+            archive_id = payload.get("archive_id") or payload.get("archiveId") or state.get("archive_id")
+            meeting_id = payload.get("meeting_id") or payload.get("meetingId") or state.get("meeting_id")
+            page_id = payload.get("page_id") or payload.get("pageId") or state.get("page_id")
+            # if nothing specified, pick latest retryable from ledger
+            if not archive_id and not (meeting_id and page_id) and LEDGER:
+                try:
+                    items = LEDGER.list_retryable(limit=1)
+                    if items:
+                        archive_id = items[0].get("archive_id")
+                except Exception:
+                    pass
+            if not archive_id and not (meeting_id and page_id):
+                self._send(400, {"ok": False, "error": "archive_id or (meeting_id,page_id) required (no retryable archive found)"})
+                return
+            threading.Thread(target=worker_retry_archive, args=(archive_id, meeting_id, page_id), daemon=True).start()
+            self._send(200, {"ok": True})
+
+        elif path == "/archives":
+            if not LEDGER:
+                self._send(200, {"ok": True, "archives": []})
+                return
+            try:
+                items = LEDGER.list_retryable(limit=20)
+                safe = []
+                for r in items:
+                    safe.append({
+                        "archive_id": r.get("archive_id"),
+                        "meeting_id": r.get("meeting_id"),
+                        "target_page_id": r.get("target_page_id"),
+                        "status": r.get("status"),
+                        "updated_at": r.get("updated_at"),
+                        "error": (r.get("error") or "")[:300],
+                    })
+                self._send(200, {"ok": True, "archives": safe})
+            except Exception as e:
+                self._send(500, {"ok": False, "error": str(e)})
 
         elif path == "/reset":
             with lock:
