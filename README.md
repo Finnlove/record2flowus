@@ -87,6 +87,8 @@ Notes:
 
 ## Setup
 
+> **First diagnostic:** run `doctor.cmd` (or `python scripts/doctor.py`) to check dependencies and configuration. It reports actionable fixes without printing secrets.
+
 ### 1) Start the local bridge
 
 ```powershell
@@ -168,6 +170,7 @@ This project controls local recording and writes to your FlowUs workspace. To re
 
 ## Troubleshooting
 
+- **Start with diagnostics**: run `doctor.cmd` (or `python scripts/doctor.py`) to identify missing dependencies or configuration mismatches.
 - **Button not visible**: reload the extension, hard-refresh the FlowUs page, check extension errors/site access, and confirm you are on a FlowUs page URL.
 - **Bridge not connected / unauthorized**: ensure `bridge.py` is running, `bridge_token` matches extension options, `bridge_allowed_origin` matches the extension ID, and host/port are correct.
 - **Recording fails**: verify Hex is installed/configured and `meetings.enabled` is true.
