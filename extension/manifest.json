@@ -7,7 +7,7 @@
   "host_permissions": [
     "https://flowus.cn/*",
     "https://*.flowus.cn/*",
-    "http://127.0.0.1:27123/*"
+    "http://127.0.0.1/*"
   ],
   "background": {
     "service_worker": "background.js"

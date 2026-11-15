@@ -584,16 +584,43 @@ def _print_startup_help(msg, fix=None):
 if __name__ == "__main__":
     if "--check" in sys.argv:
         # lightweight config/startup checks without serving
+        start_ok = True
+        browser_ok = True
+        origin_re = re.compile(r"^chrome-extension://[a-p]{32}$")
+
         if not BRIDGE_TOKEN:
-            _print_startup_help("bridge_token is not configured.", "Run `python scripts/setup.py` to generate a token, save it in config.local.json, and set the SAME token in the extension Options.")
+            print("[FAIL] bridge.start: bridge_token is not configured.", file=sys.stderr)
+            print("       fix: Run `python scripts/setup.py` to generate a token, save it in config.local.json, and set the SAME token in the extension Options.", file=sys.stderr)
+            start_ok = False
+            browser_ok = False
+        elif len(BRIDGE_TOKEN) < 32:
+            print("[FAIL] bridge.start: bridge_token is too short (must be >= 32 characters).", file=sys.stderr)
+            print("       fix: Generate a new high-entropy token via `python scripts/setup.py` and update extension Options.", file=sys.stderr)
+            start_ok = False
+            browser_ok = False
+        else:
+            print(f"[PASS] bridge.start: 配置可启动（已通过 token/基础配置检查，监听地址 http://{HOST}:{PORT}）。")
+
+        if start_ok:
+            if not ALLOWED_ORIGIN:
+                print("[FAIL] bridge.browser_connect: bridge_allowed_origin 未配置，浏览器扩展无法连接（带 Origin 的请求会被拒绝）。", file=sys.stderr)
+                print("       fix: 在 chrome://extensions 复制扩展 ID，设置 bridge_allowed_origin=chrome-extension://<ID> 到 config.local.json，并重启 bridge。", file=sys.stderr)
+                browser_ok = False
+            elif not origin_re.fullmatch(ALLOWED_ORIGIN):
+                print(f"[FAIL] bridge.browser_connect: bridge_allowed_origin 格式无效：{ALLOWED_ORIGIN}", file=sys.stderr)
+                print("       fix: 使用 chrome-extension://<32个小写字母a-p>，并与已加载扩展 ID 一致；修改后重启 bridge。", file=sys.stderr)
+                browser_ok = False
+            else:
+                print(f"[PASS] bridge.browser_connect: 浏览器扩展可连接的桥接侧前提已满足（Origin 已配置且格式有效）。请确保扩展选项中的 token/端口与配置一致。")
+
+        print("[INFO] bridge.e2e: 端到端归档可用性请运行 `python scripts/doctor.py`（检查 Hex、FlowUs CLI 认证、扩展文件等）。")
+
+        if not start_ok:
+            print("Tip: run `python scripts/doctor.py` for diagnostics, or `python scripts/setup.py` to configure.", file=sys.stderr)
             sys.exit(2)
-        if len(BRIDGE_TOKEN) < 32:
-            _print_startup_help("bridge_token is too short (must be >= 32 characters).", "Generate a new high-entropy token via `python scripts/setup.py` and update extension Options.")
-            sys.exit(2)
-        if not ALLOWED_ORIGIN:
-            print("WARNING: bridge_allowed_origin is not configured; browser requests with Origin will be rejected.", file=sys.stderr)
-            print("Fix: load the unpacked extension, copy its ID, set bridge_allowed_origin=chrome-extension://<ID> in config.local.json, then restart bridge.", file=sys.stderr)
-        print(f"OK: config checks passed for http://{HOST}:{PORT}")
+        if not browser_ok:
+            print("Tip: bridge 可启动，但浏览器扩展尚不可连接；修复上述问题后重启 bridge 并重测。", file=sys.stderr)
+            sys.exit(1)
         sys.exit(0)
 
     if HOST != "127.0.0.1":

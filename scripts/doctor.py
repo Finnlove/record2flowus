@@ -217,19 +217,7 @@ def main():
         res.add(Result.PASS, "flowus.cli", f"FlowUs CLI found: {flowus_path}")
         rc, out = run_cmd(["flowus", "--json", "whoami"], timeout=12)
         if rc == 0:
-            # try to extract non-sensitive identity hint
-            ident = ""
-            try:
-                j = json.loads(out)
-                if isinstance(j, dict):
-                    d = j.get("data") if isinstance(j.get("data"), dict) else j
-                    ident = str(d.get("name") or d.get("email") or d.get("workspace_name") or "")
-            except Exception:
-                pass
-            msg = "FlowUs CLI authenticated (`whoami` OK)."
-            if ident:
-                msg += f" Account/workspace hint: {ident}"
-            res.add(Result.PASS, "flowus.auth", msg)
+            res.add(Result.PASS, "flowus.auth", "FlowUs CLI authenticated (`whoami` OK).")
         else:
             safe = out[:200].replace(token, mask_secret(token)) if token else out[:200]
             res.add(Result.FAIL, "flowus.auth", f"FlowUs CLI not ready/authenticated (code {rc}). {safe}".strip(), "Run FlowUs CLI login/auth flow (e.g. `flowus login`/`flowus whoami`) until whoami succeeds.")
