@@ -117,9 +117,11 @@ The bridge listens on `http://127.0.0.1:27123` by default and exposes authentica
 
 1. Open `chrome://extensions` (or Edge extensions page) and enable **Developer mode**.
 2. Click **Load unpacked** and select the `extension/` folder.
-3. Copy the extension ID and set `bridge_allowed_origin` in `config.local.json` to `chrome-extension://<EXTENSION_ID>`, then restart `bridge.py`.
-4. Open the extension **Options** page and set the same `bridge_token` (and port if changed) used by `bridge.py`. Settings are stored in local extension storage.
-5. Ensure site access is allowed for FlowUs pages.
+3. Open the extension **Options** page:
+   - Save the same `bridge_token` and `bridge_port` used by `config.local.json`.
+   - Copy the shown **Extension Origin** (`chrome-extension://<ID>`) and set `bridge_allowed_origin` in `config.local.json` to that value, then restart `bridge.py`.
+   - Use **Test connection** to verify reachability/auth/origin (it reports actionable fixes for common mismatches).
+4. Ensure site access is allowed for FlowUs pages.
 
 ### 3) (Optional) Run bridge at login
 

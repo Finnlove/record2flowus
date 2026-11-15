@@ -5,37 +5,69 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>FlowUs 语音笔记设置</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 24px; color: #222; max-width: 720px; }
+    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 24px; color: #222; max-width: 760px; }
     h1 { font-size: 20px; margin: 0 0 12px; }
+    h2 { font-size: 15px; margin: 20px 0 8px; }
     label { display: block; font-weight: 600; margin: 14px 0 6px; }
-    input { width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px; }
+    input[type="password"], input[type="number"], input[type="text"] { width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px; }
     .row { margin-bottom: 8px; }
     .hint { color: #666; font-size: 13px; margin-top: 4px; line-height: 1.5; }
-    button { margin-top: 16px; padding: 8px 14px; font-size: 14px; cursor: pointer; }
-    #status { margin-left: 10px; color: #0a7; font-size: 13px; }
+    .actions { margin-top: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    button { padding: 8px 14px; font-size: 14px; cursor: pointer; }
+    #status { color: #0a7; font-size: 13px; }
+    #status.err { color: #c00; }
     code { background: #f4f4f4; padding: 1px 4px; border-radius: 4px; }
+    .box { border: 1px solid #e5e5e5; border-radius: 8px; padding: 12px 14px; background: #fafafa; }
+    ul { margin: 8px 0 0 20px; padding: 0; }
+    li { margin: 4px 0; font-size: 13px; color: #444; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .inline { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    #testResult { margin-top: 10px; font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+    #testResult.ok { color: #0a7; }
+    #testResult.fail { color: #b00020; }
   </style>
 </head>
 <body>
   <h1>FlowUs 语音笔记（Hex）扩展设置</h1>
-  <p class="hint">此设置仅保存在本机浏览器扩展存储中（<code>chrome.storage.local</code>），不会写入网页页面。请与本地 <code>config.local.json</code> 中的桥接配置保持一致。</p>
+  <p class="hint">设置仅保存在本机浏览器扩展存储（<code>chrome.storage.local</code>）。请与本地桥接 <code>config.local.json</code> 保持一致。</p>
 
   <div class="row">
-    <label for="bridge_token">Bridge Token（必填）</label>
+    <label for="bridge_token">Bridge Token（必填，≥32 字符）</label>
     <input id="bridge_token" type="password" autocomplete="off" placeholder="与 config.local.json 的 bridge_token 一致" />
-    <div class="hint">用于认证本地桥接接口，防止未授权调用。请使用随机生成的高强度密钥。</div>
+    <div class="hint">用于认证本地桥接接口。使用高强度随机密钥，并与 <code>config.local.json</code> 及本扩展选项保持一致。</div>
   </div>
 
   <div class="row">
     <label for="bridge_port">Bridge 端口</label>
     <input id="bridge_port" type="number" min="1" max="65535" value="27123" />
-    <div class="hint">默认 27123，需与 <code>bridge_port</code> 一致。桥接仅监听 <code>127.0.0.1</code>。</div>
+    <div class="hint">默认 27123，需与 <code>config.local.json</code> 的 <code>bridge_port</code> 一致（桥接仅监听 <code>127.0.0.1</code>）。</div>
   </div>
 
-  <button id="save">保存设置</button><span id="status"></span>
+  <div class="actions">
+    <button id="save">保存设置</button>
+    <button id="test" type="button">测试连接</button>
+    <span id="status"></span>
+  </div>
+  <div id="testResult" class="hint"></div>
 
-  <hr style="margin:24px 0; border:none; border-top:1px solid #eee;" />
-  <p class="hint"><strong>重要：</strong>在 <code>config.local.json</code> 中还需设置 <code>bridge_allowed_origin</code> 为本扩展的 Origin（形如 <code>chrome-extension://&lt;扩展ID&gt;</code>）。扩展 ID 可在 <code>chrome://extensions</code> 页面查看（加载后固定）。</p>
+  <h2>配置对齐清单</h2>
+  <div class="box">
+    <ul>
+      <li>1) 启动本地桥接：<code>python bridge.py</code> 或 <code>start-bridge.cmd</code>（可先运行 <code>doctor.cmd</code>/<code>setup.cmd</code>）。</li>
+      <li>2) 在此页填写并保存与 <code>config.local.json</code> 相同的 <code>bridge_token</code> 和端口。</li>
+      <li>3) 将 <code>config.local.json</code> 的 <code>bridge_allowed_origin</code> 设置为本扩展 Origin，并<strong>重启 bridge.py</strong>。</li>
+    </ul>
+  </div>
+
+  <h2>本扩展 Origin（用于 bridge_allowed_origin）</h2>
+  <div class="box">
+    <div class="inline">
+      <code id="extOrigin" class="mono">chrome-extension://...</code>
+      <button id="copyOrigin" type="button">复制 Origin</button>
+      <span id="copyStatus" class="hint"></span>
+    </div>
+    <div class="hint">将上面的值写入 <code>config.local.json</code>：<code>"bridge_allowed_origin": "chrome-extension://&lt;扩展ID&gt;"</code>。扩展 ID 也可在 <code>chrome://extensions</code> 查看（重新加载后请确认一致）。</div>
+  </div>
 
   <script src="options.js"></script>
 </body>

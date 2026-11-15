@@ -85,11 +85,18 @@
     btn.disabled = false;
   }
 
+  function formatError(res, fallback) {
+    if (!res) return fallback || "未知错误";
+    const msg = res.error || fallback || "未知错误";
+    const fix = res.fix ? `（${res.fix}）` : "";
+    return msg + fix;
+  }
+
   async function refresh() {
     if (!ensureUI()) return;
     const res = await send("state");
     if (res && res.ok) setUI(res.state);
-    else setUI({ status: "error", error: res && res.error ? res.error : "桥接未连接（请启动 bridge.py）" });
+    else setUI({ status: "error", error: formatError(res, "桥接未连接（请启动 bridge.py）") });
   }
 
   async function onClick() {
@@ -105,11 +112,11 @@
       }
       setUI({ status: "starting", message: "正在唤起 Hex 录音…" });
       const r = await send("start", { pageId, url: location.href, title: document.title || "" });
-      if (!r || !r.ok) setUI({ status: "error", error: r && r.error ? r.error : "启动失败" });
+      if (!r || !r.ok) setUI({ status: "error", error: formatError(r, "启动失败") });
     } else if (s === "recording" || s === "starting") {
       setUI({ status: "stopping", message: "停止并整理上传…" });
       const r = await send("stop");
-      if (!r || !r.ok) setUI({ status: "error", error: r && r.error ? r.error : "停止失败" });
+      if (!r || !r.ok) setUI({ status: "error", error: formatError(r, "停止失败") });
     }
     setTimeout(refresh, 600);
   }
