@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlowUs 语音笔记设置</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 24px; color: #222; max-width: 720px; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    label { display: block; font-weight: 600; margin: 14px 0 6px; }
+    input { width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px; }
+    .row { margin-bottom: 8px; }
+    .hint { color: #666; font-size: 13px; margin-top: 4px; line-height: 1.5; }
+    button { margin-top: 16px; padding: 8px 14px; font-size: 14px; cursor: pointer; }
+    #status { margin-left: 10px; color: #0a7; font-size: 13px; }
+    code { background: #f4f4f4; padding: 1px 4px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>FlowUs 语音笔记（Hex）扩展设置</h1>
+  <p class="hint">此设置仅保存在本机浏览器扩展存储中（<code>chrome.storage.local</code>），不会写入网页页面。请与本地 <code>config.local.json</code> 中的桥接配置保持一致。</p>
+
+  <div class="row">
+    <label for="bridge_token">Bridge Token（必填）</label>
+    <input id="bridge_token" type="password" autocomplete="off" placeholder="与 config.local.json 的 bridge_token 一致" />
+    <div class="hint">用于认证本地桥接接口，防止未授权调用。请使用随机生成的高强度密钥。</div>
+  </div>
+
+  <div class="row">
+    <label for="bridge_port">Bridge 端口</label>
+    <input id="bridge_port" type="number" min="1" max="65535" value="27123" />
+    <div class="hint">默认 27123，需与 <code>bridge_port</code> 一致。桥接仅监听 <code>127.0.0.1</code>。</div>
+  </div>
+
+  <button id="save">保存设置</button><span id="status"></span>
+
+  <hr style="margin:24px 0; border:none; border-top:1px solid #eee;" />
+  <p class="hint"><strong>重要：</strong>在 <code>config.local.json</code> 中还需设置 <code>bridge_allowed_origin</code> 为本扩展的 Origin（形如 <code>chrome-extension://&lt;扩展ID&gt;</code>）。扩展 ID 可在 <code>chrome://extensions</code> 页面查看（加载后固定）。</p>
+
+  <script src="options.js"></script>
+</body>
+</html>

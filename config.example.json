@@ -2,9 +2,8 @@
   "hex_exe": "C:\\Users\\<USER>\\AppData\\Roaming\\hex\\versions\\<VERSION>\\hex.exe",
   "hex_meetings_dir": "",
   "hex_export_dir": "",
-  "bridge_host": "127.0.0.1",
   "bridge_port": 27123,
   "sync_script": "scripts/sync_to_flowus.py",
-  "default_database_id": "",
-  "default_parent_page_id": ""
+  "bridge_token": "REPLACE_WITH_A_RANDOM_TOKEN_AT_LEAST_32_CHARS",
+  "bridge_allowed_origin": "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID"
 }

@@ -34,7 +34,9 @@ It supports:
 │  ├─ manifest.json
 │  ├─ background.js
 │  ├─ content.js
-│  └─ content.css
+│  ├─ content.css
+│  ├─ options.html            # Extension settings (bridge token/port)
+│  └─ options.js
 ├─ scripts/
 │  └─ sync_to_flowus.py       # Sync Hex meeting artifacts to FlowUs (beautified)
 ├─ bridge.py                  # Local HTTP bridge: extension ↔ Hex ↔ sync
@@ -59,7 +61,7 @@ It supports:
 
 ## Configuration
 
-1. Copy `config.example.json` to `config.json` (and/or `config.local.json`, which is gitignored).
+1. Copy `config.example.json` to `config.local.json` (**recommended**, gitignored). `config.json` is also supported but gitignored to reduce accidental commits — prefer `config.local.json` for personal settings.
 2. Adjust values:
 
 ```json
@@ -67,18 +69,20 @@ It supports:
   "hex_exe": "C:\\Users\\<USER>\\AppData\\Roaming\\hex\\versions\\<VERSION>\\hex.exe",
   "hex_meetings_dir": "",
   "hex_export_dir": "",
-  "bridge_host": "127.0.0.1",
   "bridge_port": 27123,
   "sync_script": "scripts/sync_to_flowus.py",
-  "default_database_id": "",
-  "default_parent_page_id": ""
+  "bridge_token": "REPLACE_WITH_A_RANDOM_TOKEN_AT_LEAST_32_CHARS",
+  "bridge_allowed_origin": "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID"
 }
 ```
 
 Notes:
+- **`bridge_token` (required):** random secret used to authenticate all bridge API calls. Generate a strong value (e.g. 32+ random bytes/characters) and keep it private. You must set the same token in the browser extension options.
+- **`bridge_allowed_origin` (recommended/required for browser use):** the extension origin in the form `chrome-extension://<EXTENSION_ID>`. Find the extension ID on `chrome://extensions` after loading it. Requests with missing/mismatched `Origin` (when configured) are rejected.
+- **Security defaults:** the bridge binds only to `127.0.0.1`, validates the `Host` header, enforces request size/format limits, validates FlowUs page IDs/URLs and meeting/artifact paths, and returns a sanitized `/state`.
 - If `hex_exe` is empty, `bridge.py` attempts auto-detection under `%APPDATA%\hex\versions\*` and falls back to `hex`.
-- Environment variables can override config: `HEX_EXE`, `HEX_MEETINGS_DIR`, `SYNC_SCRIPT`, `BRIDGE_HOST`, `BRIDGE_PORT`.
-- Do **not** commit `config.local.json`, tokens, cookies, or personal workspace IDs.
+- Environment variables can override config: `HEX_EXE`, `HEX_MEETINGS_DIR`, `HEX_EXPORT_DIR`, `SYNC_SCRIPT`, `BRIDGE_PORT`, `BRIDGE_TOKEN`, `BRIDGE_ALLOWED_ORIGIN`.
+- Do **not** commit `config.json`, `config.local.json`, tokens, cookies, or personal workspace IDs.
 
 ## Setup
 
@@ -90,13 +94,15 @@ python bridge.py
 .\start-bridge.cmd
 ```
 
-The bridge listens on `http://127.0.0.1:27123` by default and exposes: `/ping`, `/state`, `/start`, `/stop`, `/reset`.
+The bridge listens on `http://127.0.0.1:27123` by default and exposes authenticated endpoints: `/ping`, `/state`, `/start`, `/stop`, `/reset`. Requests require `Authorization: Bearer <bridge_token>`, valid `Host`, and (for browser calls) the configured allowed extension origin.
 
 ### 2) Load the browser extension
 
 1. Open `chrome://extensions` (or Edge extensions page) and enable **Developer mode**.
 2. Click **Load unpacked** and select the `extension/` folder.
-3. Ensure site access is allowed for FlowUs pages.
+3. Copy the extension ID and set `bridge_allowed_origin` in `config.local.json` to `chrome-extension://<EXTENSION_ID>`, then restart `bridge.py`.
+4. Open the extension **Options** page and set the same `bridge_token` (and port if changed) used by `bridge.py`. Settings are stored in local extension storage.
+5. Ensure site access is allowed for FlowUs pages.
 
 ### 3) (Optional) Run bridge at login
 
@@ -155,12 +161,17 @@ Useful options:
 - Bridge relies on local Hex CLI behavior and FlowUs CLI/API availability.
 - Browser extension cannot start the local bridge by itself; use auto-start or a Native Messaging host for on-demand launch.
 
+## Security notes
+
+This project controls local recording and writes to your FlowUs workspace. To reduce risk, the bridge enforces token authentication, loopback-only binding/host checks, extension-origin allowlisting (CORS), strict input validation (body size/type, FlowUs page ID/URL, meeting ID and artifact path confinement), and sanitized status responses. Keep your `bridge_token` secret, do not expose the bridge beyond localhost, and only load the extension from a trusted local copy.
+
 ## Troubleshooting
 
 - **Button not visible**: reload the extension, hard-refresh the FlowUs page, check extension errors/site access, and confirm you are on a FlowUs page URL.
-- **Bridge not connected**: ensure `bridge.py` is running and reachable at the configured host/port.
+- **Bridge not connected / unauthorized**: ensure `bridge.py` is running, `bridge_token` matches extension options, `bridge_allowed_origin` matches the extension ID, and host/port are correct.
 - **Recording fails**: verify Hex is installed/configured and `meetings.enabled` is true.
 - **Upload/append fails**: verify `flowus whoami`/permissions and that the target page is editable.
+- **Processing fails**: check the local bridge console/log output for details (the UI shows sanitized status).
 
 ## License
 

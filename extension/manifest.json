@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "FlowUs 语音笔记 (Hex)",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "在 FlowUs 页面一键触发 Hex 本地录音，自动转写整理并回传当前页",
   "permissions": ["storage"],
   "host_permissions": [
@@ -12,6 +12,7 @@
   "background": {
     "service_worker": "background.js"
   },
+  "options_page": "options.html",
   "content_scripts": [
     {
       "matches": ["https://flowus.cn/*", "https://*.flowus.cn/*"],

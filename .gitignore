@@ -17,6 +17,7 @@ Thumbs.db
 .idea/
 
 # Local/runtime
+config.json
 config.local.json
 *.log
 *.tmp

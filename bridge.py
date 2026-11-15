@@ -1,3 +1,4 @@
+import hmac
 import json
 import os
 import re
@@ -6,11 +7,15 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MAX_BODY_SIZE = 8 * 1024
+READ_TIMEOUT = 10
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 def load_config():
@@ -44,11 +49,15 @@ def detect_hex_exe():
 CFG = load_config()
 HEX_EXE = os.environ.get("HEX_EXE") or CFG.get("hex_exe") or detect_hex_exe()
 HEX_MEETINGS = os.environ.get("HEX_MEETINGS_DIR") or CFG.get("hex_meetings_dir") or os.path.join(os.environ.get("APPDATA", ""), "hex", "meetings")
+HEX_EXPORT_DIR = os.environ.get("HEX_EXPORT_DIR") or CFG.get("hex_export_dir") or ""
 SYNC_SCRIPT = os.environ.get("SYNC_SCRIPT") or CFG.get("sync_script") or os.path.join(BASE_DIR, "scripts", "sync_to_flowus.py")
 if not os.path.isabs(SYNC_SCRIPT):
     SYNC_SCRIPT = os.path.join(BASE_DIR, SYNC_SCRIPT)
-HOST = os.environ.get("BRIDGE_HOST") or CFG.get("bridge_host") or "127.0.0.1"
+HOST = "127.0.0.1"
 PORT = int(os.environ.get("BRIDGE_PORT") or CFG.get("bridge_port") or 27123)
+BRIDGE_TOKEN = str(os.environ.get("BRIDGE_TOKEN") or CFG.get("bridge_token") or "").strip()
+ALLOWED_ORIGIN = str(os.environ.get("BRIDGE_ALLOWED_ORIGIN") or CFG.get("bridge_allowed_origin") or "").strip()
+EXPECTED_HOST = f"127.0.0.1:{PORT}"
 
 state = {
     "status": "idle",  # idle|starting|recording|stopping|processing|done|error
@@ -93,22 +102,56 @@ def find_meeting_by_id(mid):
     return None
 
 
+def _is_inside(path, base):
+    try:
+        real_path = os.path.realpath(path)
+        real_base = os.path.realpath(base)
+        return os.path.commonpath([real_path, real_base]) == real_base
+    except Exception:
+        return False
+
+
+def _validate_meeting_id(mid):
+    return isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", mid) is not None
+
+
+def _resolve_transcript_path(export_path, meeting_dir):
+    candidates = []
+    if isinstance(export_path, str) and export_path.strip():
+        ep = os.path.normpath(export_path.strip())
+        allowed = [meeting_dir, HEX_MEETINGS]
+        if HEX_EXPORT_DIR:
+            allowed.append(HEX_EXPORT_DIR)
+        for base in allowed:
+            if base and _is_inside(ep, base) and os.path.isfile(ep):
+                candidates.append(ep)
+    fallback = os.path.join(meeting_dir, "transcript.md")
+    if os.path.isfile(fallback):
+        candidates.append(fallback)
+    return candidates[0] if candidates else None
+
+
 def load_meeting_artifacts(mid):
-    d = os.path.join(HEX_MEETINGS, mid)
+    if not _validate_meeting_id(mid):
+        raise RuntimeError("invalid meeting id")
+    d = os.path.normpath(os.path.join(HEX_MEETINGS, mid))
+    if not _is_inside(d, HEX_MEETINGS):
+        raise RuntimeError("invalid meeting path")
     mf = os.path.join(d, "manifest.json")
     if not os.path.isfile(mf):
         raise RuntimeError("manifest not found")
     with open(mf, "r", encoding="utf-8") as f:
         m = json.load(f)
-    export_path = m.get("export_path")
-    transcript_md = export_path if (export_path and os.path.isfile(export_path)) else os.path.join(d, "transcript.md")
-    if not os.path.isfile(transcript_md):
+    transcript_md = _resolve_transcript_path(m.get("export_path"), d)
+    if not transcript_md:
         raise RuntimeError("transcript not found")
     with open(transcript_md, "r", encoding="utf-8") as f:
         transcript = f.read()
     wav = os.path.join(d, "microphone.wav")
     if not os.path.isfile(wav):
         wav = os.path.join(d, "system.wav")
+    if not os.path.isfile(wav) or not _is_inside(wav, HEX_MEETINGS):
+        raise RuntimeError("audio file not found")
     return {"id": mid, "dir": d, "manifest": m, "transcript": transcript, "wav": wav, "transcript_path": transcript_md}
 
 
@@ -268,11 +311,11 @@ def worker_start(page_id, page_title, page_url):
             for m in list_meetings():
                 if m.get("in_progress"):
                     mid = m.get("id"); break
-        if not mid:
-            raise RuntimeError(f"cannot determine meeting id. output: {(r.stdout or r.stderr)[:500]}")
+        if not mid or not _validate_meeting_id(mid):
+            raise RuntimeError("cannot determine meeting id")
         with lock:
             state["meeting_id"] = mid
-            state["message"] = f"recording meeting {mid}"
+            state["message"] = "recording in progress"
     except Exception as e:
         with lock:
             state.update({"status": "error", "error": str(e), "message": "start failed"})
@@ -291,7 +334,7 @@ def worker_stop_and_process():
                     mid = m.get("id"); break
             if not mid:
                 mid = latest_meeting_id()
-        if not mid:
+        if not _validate_meeting_id(mid or ""):
             raise RuntimeError("no meeting to stop/process")
         with lock:
             state.update({"meeting_id": mid, "status": "processing", "message": "waiting for transcript"})
@@ -308,62 +351,179 @@ def worker_stop_and_process():
             state.update({"status": "error", "error": str(e), "message": "processing failed"})
 
 
+def _is_flowus_url(url):
+    if not isinstance(url, str) or not url:
+        return False
+    try:
+        u = urlparse(url)
+    except Exception:
+        return False
+    if u.scheme != "https":
+        return False
+    host = (u.hostname or "").lower()
+    return host == "flowus.cn" or host.endswith(".flowus.cn")
+
+
+def _valid_page_id(pid):
+    return isinstance(pid, str) and UUID_RE.fullmatch(pid) is not None
+
+
+def _public_state():
+    with lock:
+        return {
+            "status": state.get("status"),
+            "message": state.get("message") or "",
+            "has_error": bool(state.get("error")),
+            "page_bound": bool(state.get("page_id")),
+        }
+
+
+def _authorized(handler):
+    auth = handler.headers.get("Authorization", "")
+    expected = "Bearer " + BRIDGE_TOKEN if BRIDGE_TOKEN else ""
+    if not BRIDGE_TOKEN or not auth.startswith("Bearer "):
+        return False
+    return hmac.compare_digest(auth, expected)
+
+
 class Handler(BaseHTTPRequestHandler):
+    server_version = "FlowUsVoiceBridge/1.0"
+
+    def _cors_origin(self):
+        origin = self.headers.get("Origin", "")
+        if ALLOWED_ORIGIN and origin == ALLOWED_ORIGIN:
+            return origin
+        return None
+
     def _send(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "content-type")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _reject(self, code, msg):
+        self._send(code, {"ok": False, "error": msg})
+
+    def _read_json(self):
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype and ctype != "application/json":
+            raise ValueError("invalid content type")
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            raise ValueError("missing content length")
+        try:
+            length = int(raw_len)
+        except Exception:
+            raise ValueError("invalid content length")
+        if length < 0 or length > MAX_BODY_SIZE:
+            raise ValueError("request too large")
+        try:
+            self.connection.settimeout(READ_TIMEOUT)
+        except Exception:
+            pass
+        raw = self.rfile.read(length) if length else b"{}"
+        if len(raw) != length:
+            raise ValueError("incomplete request body")
+        try:
+            data = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            raise ValueError("invalid json")
+        if not isinstance(data, dict):
+            raise ValueError("json object required")
+        return data
+
+    def _preflight(self):
+        host = (self.headers.get("Host") or "").lower()
+        if host != EXPECTED_HOST.lower():
+            self._reject(403, "invalid host")
+            return False
+        origin = self.headers.get("Origin")
+        if origin and not self._cors_origin():
+            self._reject(403, "forbidden origin")
+            return False
+        return True
+
+    def _authorize(self):
+        if not BRIDGE_TOKEN:
+            self._reject(503, "bridge token not configured")
+            return False
+        if not _authorized(self):
+            self._reject(401, "unauthorized")
+            return False
+        return True
 
     def do_OPTIONS(self):
+        if not self._preflight():
+            return
         self._send(204, {})
 
     def do_GET(self):
+        if not self._preflight():
+            return
+        if not self._authorize():
+            return
         path = urlparse(self.path).path
         if path == "/state":
-            with lock:
-                self._send(200, {"ok": True, "state": dict(state)})
+            self._send(200, {"ok": True, "state": _public_state()})
         elif path == "/ping":
-            self._send(200, {"ok": True})
+            self._send(200, {"ok": True, "status": "ok"})
         else:
-            self._send(404, {"ok": False, "error": "not found"})
+            self._reject(404, "not found")
 
     def do_POST(self):
+        if not self._preflight():
+            return
+        if not self._authorize():
+            return
         path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
         try:
-            payload = json.loads(raw.decode("utf-8") or "{}")
+            payload = self._read_json()
+        except ValueError as e:
+            self._reject(400, str(e))
+            return
         except Exception:
-            payload = {}
+            self._reject(400, "bad request")
+            return
+
         if path == "/start":
             with lock:
                 if state.get("status") in ("recording", "stopping", "processing", "starting"):
-                    self._send(409, {"ok": False, "error": "busy", "state": dict(state)})
+                    self._send(409, {"ok": False, "error": "busy", "state": _public_state()})
                     return
-                state.update({"started_at": time.time(), "status": "starting", "message": "starting", "result": None, "error": None})
             page_id = payload.get("pageId") or payload.get("page_id")
-            page_title = payload.get("title")
-            page_url = payload.get("url")
-            if not page_id:
-                with lock:
-                    state.update({"status": "error", "error": "missing pageId"})
-                self._send(400, {"ok": False, "error": "missing pageId"})
+            page_title = str(payload.get("title") or "")[:300]
+            page_url = str(payload.get("url") or "")[:1000]
+            if not _valid_page_id(page_id):
+                self._reject(400, "invalid page id")
                 return
+            if page_url and not _is_flowus_url(page_url):
+                self._reject(400, "invalid page url")
+                return
+            with lock:
+                state.update({"started_at": time.time(), "status": "starting", "message": "starting", "result": None, "error": None,
+                              "page_id": page_id, "page_title": page_title, "page_url": page_url})
             threading.Thread(target=worker_start, args=(page_id, page_title, page_url), daemon=True).start()
             self._send(200, {"ok": True})
+
         elif path == "/stop":
             with lock:
                 if state.get("status") not in ("recording", "starting"):
-                    self._send(409, {"ok": False, "error": "not recording", "state": dict(state)})
+                    self._send(409, {"ok": False, "error": "not recording", "state": _public_state()})
                     return
             threading.Thread(target=worker_stop_and_process, daemon=True).start()
             self._send(200, {"ok": True})
+
         elif path == "/reset":
             with lock:
                 if state.get("status") in ("recording", "stopping", "processing", "starting"):
@@ -372,13 +532,20 @@ class Handler(BaseHTTPRequestHandler):
                 state.update({"status": "idle", "message": "", "error": None, "result": None, "meeting_id": None})
             self._send(200, {"ok": True})
         else:
-            self._send(404, {"ok": False, "error": "not found"})
+            self._reject(404, "not found")
 
     def log_message(self, fmt, *args):
         sys.stderr.write("[bridge] " + (fmt % args) + "\n")
 
 
 if __name__ == "__main__":
+    if HOST != "127.0.0.1":
+        raise RuntimeError("Bridge must bind to 127.0.0.1")
+    if not BRIDGE_TOKEN:
+        print("ERROR: bridge_token is not configured. Set it in config.local.json (or BRIDGE_TOKEN env).", file=sys.stderr)
+        sys.exit(2)
+    if not ALLOWED_ORIGIN:
+        print("WARNING: bridge_allowed_origin is not configured; cross-origin browser requests will be rejected.", file=sys.stderr)
     print(f"Bridge listening on http://{HOST}:{PORT}")
     print(f"HEX_EXE={HEX_EXE}")
     print(f"SYNC_SCRIPT={SYNC_SCRIPT}")

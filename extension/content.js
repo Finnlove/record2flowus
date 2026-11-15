@@ -52,7 +52,7 @@
     if (!ensureUI()) return;
     const s = (st && st.status) || "idle";
     const msg = (st && st.message) || "";
-    const err = (st && st.error) || "";
+    const err = (st && st.error) || (st && st.has_error ? "处理失败，请查看本地 bridge 日志" : "");
     btn.className = "";
     statusEl.classList.remove("fvn-hidden");
     if (s === "idle") {
