@@ -2,6 +2,10 @@
   if (window.__flowusVoiceNoteBooted) return;
   window.__flowusVoiceNoteBooted = true;
 
+  const POS_KEY = "fvn_button_pos";
+  const DEFAULT_POS = { right: 16, bottom: 88 }; // avoid common FlowUs bottom-right controls
+  const TIP_AUTO_HIDE_MS = 3500;
+
   function getPageId() {
     const p = location.pathname || "";
     let m = p.match(/\/luna\/([0-9a-fA-F-]{36})/);
@@ -44,26 +48,147 @@
     });
   }
 
-  let btn, statusEl, polling;
+  function storageGet(key) {
+    return new Promise((resolve) => {
+      try {
+        if (!chrome?.storage?.local) return resolve(null);
+        chrome.storage.local.get([key], (data) => resolve(data ? data[key] : null));
+      } catch (e) { resolve(null); }
+    });
+  }
+
+  function storageSet(obj) {
+    try { chrome?.storage?.local?.set(obj); } catch (e) {}
+  }
+
+  let root, btn, tipEl, polling;
+  let tipTimer = null;
+  let dragState = null;
+  let suppressClick = false;
+
+  function clamp(val, min, max) { return Math.min(Math.max(val, min), max); }
+
+  async function loadPosition() {
+    const pos = await storageGet(POS_KEY);
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+      return { left: pos.left, top: pos.top };
+    }
+    return null;
+  }
+
+  function applyPosition(pos) {
+    if (!root) return;
+    const w = 28, h = 28, margin = 4;
+    const maxLeft = Math.max(margin, window.innerWidth - w - margin);
+    const maxTop = Math.max(margin, window.innerHeight - h - margin);
+    if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+      const left = clamp(pos.left, margin, maxLeft);
+      const top = clamp(pos.top, margin, maxTop);
+      root.style.left = left + "px";
+      root.style.top = top + "px";
+      root.style.right = "auto";
+      root.style.bottom = "auto";
+    } else {
+      root.style.right = DEFAULT_POS.right + "px";
+      root.style.bottom = DEFAULT_POS.bottom + "px";
+      root.style.left = "auto";
+      root.style.top = "auto";
+    }
+  }
 
   function ensureUI() {
-    let root = document.getElementById("fvn-root");
+    root = document.getElementById("fvn-root");
     if (!root) {
       root = document.createElement("div");
       root.id = "fvn-root";
       root.innerHTML = `
-        <button id="fvn-btn" title="语音笔记：点击开始/停止">🎙️ 语音笔记</button>
-        <div id="fvn-status" class="fvn-hidden"></div>
+        <button id="fvn-btn" type="button" aria-label="语音笔记">🎙️</button>
+        <div id="fvn-tip"></div>
       `;
       (document.body || document.documentElement).appendChild(root);
       btn = root.querySelector("#fvn-btn");
-      statusEl = root.querySelector("#fvn-status");
-      btn.addEventListener("click", onClick);
+      tipEl = root.querySelector("#fvn-tip");
+      btn.addEventListener("click", onClick, true);
+      btn.addEventListener("pointerdown", onPointerDown);
+      window.addEventListener("resize", onResize);
+      loadPosition().then(applyPosition);
     } else {
       btn = root.querySelector("#fvn-btn");
-      statusEl = root.querySelector("#fvn-status");
+      tipEl = root.querySelector("#fvn-tip");
     }
-    return !!(btn && statusEl);
+    return !!(btn && tipEl);
+  }
+
+  function onResize() {
+    if (!root) return;
+    if (root.style.left && root.style.left !== "auto") {
+      const left = parseFloat(root.style.left) || 0;
+      const top = parseFloat(root.style.top) || 0;
+      applyPosition({ left, top });
+    }
+  }
+
+  function onPointerDown(e) {
+    if (e.button !== 0) return;
+    ensureUI();
+    const rect = root.getBoundingClientRect();
+    dragState = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      origLeft: rect.left,
+      origTop: rect.top,
+      moved: false,
+    };
+    try { btn.setPointerCapture(e.pointerId); } catch (_) {}
+    btn.addEventListener("pointermove", onPointerMove);
+    btn.addEventListener("pointerup", onPointerUp);
+    btn.addEventListener("pointercancel", onPointerUp);
+  }
+
+  function onPointerMove(e) {
+    if (!dragState || e.pointerId !== dragState.pointerId) return;
+    const dx = e.clientX - dragState.startX;
+    const dy = e.clientY - dragState.startY;
+    if (!dragState.moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) {
+      dragState.moved = true;
+      suppressClick = true;
+    }
+    if (dragState.moved) {
+      applyPosition({ left: dragState.origLeft + dx, top: dragState.origTop + dy });
+    }
+  }
+
+  function onPointerUp(e) {
+    if (!dragState || e.pointerId !== dragState.pointerId) return;
+    btn.removeEventListener("pointermove", onPointerMove);
+    btn.removeEventListener("pointerup", onPointerUp);
+    btn.removeEventListener("pointercancel", onPointerUp);
+    try { btn.releasePointerCapture(e.pointerId); } catch (_) {}
+    if (dragState.moved) {
+      const rect = root.getBoundingClientRect();
+      storageSet({ [POS_KEY]: { left: rect.left, top: rect.top } });
+      setTimeout(() => { suppressClick = false; }, 0);
+    }
+    dragState = null;
+  }
+
+  function showTip(text, sticky) {
+    if (!ensureUI()) return;
+    tipEl.textContent = text || "";
+    if (tipTimer) { clearTimeout(tipTimer); tipTimer = null; }
+    if (text) {
+      root.classList.add("fvn-show-tip");
+      if (!sticky) {
+        tipTimer = setTimeout(() => {
+          root.classList.remove("fvn-show-tip");
+          // keep text for hover/title context? clear to reduce clutter
+          tipEl.textContent = "";
+        }, TIP_AUTO_HIDE_MS);
+      }
+    } else {
+      root.classList.remove("fvn-show-tip");
+    }
   }
 
   function setUI(st) {
@@ -72,35 +197,46 @@
     const msg = (st && st.message) || "";
     const err = (st && st.error) || (st && st.has_error ? "处理失败，请查看本地 bridge 日志" : "");
     btn.className = "";
-    statusEl.classList.remove("fvn-hidden");
-    if (s === "idle") {
-      btn.textContent = "🎙️ 语音笔记";
-      btn.classList.add("fvn-idle");
-      const pid = getPageId();
-      statusEl.textContent = pid ? "就绪：点击开始录音并归档到当前页" : "就绪：请打开具体 FlowUs 页面后使用";
-    } else if (s === "recording" || s === "starting") {
-      btn.textContent = "⏹ 停止并归档";
-      btn.classList.add("fvn-rec");
-      statusEl.textContent = msg || "录音中…";
-    } else if (s === "stopping" || s === "processing") {
-      btn.textContent = "⏳ 处理中";
-      btn.classList.add("fvn-busy");
-      statusEl.textContent = msg || "处理中…";
-      btn.disabled = true;
-      return;
-    } else if (s === "done") {
-      btn.textContent = "🎙️ 语音笔记";
-      btn.classList.add("fvn-done");
-      statusEl.textContent = "完成：已回传到当前页";
-    } else if (s === "error") {
-      btn.textContent = "🎙️ 语音笔记";
-      btn.classList.add("fvn-err");
-      statusEl.textContent = "失败：" + (err || msg || "未知错误");
-    } else {
-      btn.textContent = "🎙️ 语音笔记";
-      statusEl.textContent = msg || s;
-    }
     btn.disabled = false;
+
+    const pid = getPageId();
+    if (s === "idle") {
+      btn.textContent = "🎙️";
+      btn.classList.add("fvn-idle");
+      const hint = pid ? "就绪：点击开始录音并归档到当前页（可拖动位置）" : "就绪：请打开具体 FlowUs 页面后使用（可拖动位置）";
+      btn.title = "语音笔记 - " + hint;
+      showTip("", false);
+    } else if (s === "recording" || s === "starting") {
+      btn.textContent = "⏺";
+      btn.classList.add("fvn-rec");
+      const hint = msg || "录音中…点击停止并归档";
+      btn.title = "语音笔记 - " + hint;
+      showTip(hint, true);
+    } else if (s === "stopping" || s === "processing") {
+      btn.textContent = "⏳";
+      btn.classList.add("fvn-busy");
+      btn.disabled = true;
+      const hint = msg || "处理中…";
+      btn.title = "语音笔记 - " + hint;
+      showTip(hint, true);
+    } else if (s === "done") {
+      btn.textContent = "✓";
+      btn.classList.add("fvn-done");
+      const hint = "完成：已回传到当前页";
+      btn.title = "语音笔记 - " + hint;
+      showTip(hint, false);
+    } else if (s === "error") {
+      btn.textContent = "⚠";
+      btn.classList.add("fvn-err");
+      const hint = "失败：" + (err || msg || "未知错误");
+      btn.title = "语音笔记 - " + hint;
+      showTip(hint, true);
+    } else {
+      btn.textContent = "🎙️";
+      const hint = msg || s;
+      btn.title = "语音笔记 - " + hint;
+      showTip(hint, false);
+    }
   }
 
   function formatError(res, fallback) {
@@ -117,7 +253,8 @@
     else setUI({ status: "error", error: formatError(res, "桥接未连接（请启动 bridge.py）") });
   }
 
-  async function onClick() {
+  async function onClick(e) {
+    if (suppressClick) { e.preventDefault(); e.stopPropagation(); return; }
     const res = await send("state");
     const st = res && res.ok ? res.state : { status: "idle" };
     const s = st.status || "idle";
