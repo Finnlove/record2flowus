@@ -3,10 +3,10 @@
   z-index: 2147483647;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   color-scheme: light dark;
-  --fvn-fg: rgba(120, 120, 120, 0.85);
-  --fvn-border: rgba(160, 160, 160, 0.45);
-  --fvn-bg: rgba(255, 255, 255, 0.35);
-  --fvn-bg-hover: rgba(255, 255, 255, 0.55);
+  --fvn-fg: rgba(120, 120, 120, 0.8);
+  --fvn-border: rgba(160, 160, 160, 0.28);
+  --fvn-bg: rgba(255, 255, 255, 0.08);
+  --fvn-bg-hover: rgba(255, 255, 255, 0.18);
   --fvn-tip-bg: rgba(255, 255, 255, 0.92);
   --fvn-tip-fg: rgba(60, 60, 60, 0.95);
   --fvn-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
@@ -18,10 +18,10 @@
 
 @media (prefers-color-scheme: dark) {
   #fvn-root {
-    --fvn-fg: rgba(180, 180, 180, 0.8);
-    --fvn-border: rgba(200, 200, 200, 0.22);
-    --fvn-bg: rgba(40, 40, 40, 0.25);
-    --fvn-bg-hover: rgba(60, 60, 60, 0.4);
+    --fvn-fg: rgba(180, 180, 180, 0.75);
+    --fvn-border: rgba(200, 200, 200, 0.16);
+    --fvn-bg: rgba(30, 30, 30, 0.06);
+    --fvn-bg-hover: rgba(60, 60, 60, 0.18);
     --fvn-tip-bg: rgba(40, 40, 40, 0.94);
     --fvn-tip-fg: rgba(230, 230, 230, 0.95);
     --fvn-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
@@ -45,13 +45,13 @@
   border-radius: 8px;
   box-shadow: none;
   cursor: grab;
-  opacity: 0.72;
+  opacity: 0.65;
   transition: opacity .15s ease, background .15s ease, border-color .15s ease, color .15s ease;
   user-select: none;
   -webkit-user-select: none;
   touch-action: none;
-  backdrop-filter: blur(4px);
-  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
 }
 
 #fvn-root:hover #fvn-btn,
