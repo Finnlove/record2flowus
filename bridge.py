@@ -234,20 +234,103 @@ def _split_sentences(text):
     return out
 
 
-def _pick_points(text, limit=5):
-    points, seen = [], set()
-    for s in _split_sentences(text):
-        # ignore very short or non-informative fragments
-        plain = re.sub(r"[\s`*_~#>\[\]\(\)]", "", s)
-        if len(plain) < 8:
+_FILLER_RE = re.compile(
+    r"(就是|然后呢|那么呢|那么|然后|所以呢|所以|这个呢|这个|那个呢|那个|嗯+|啊+|哈+|呀+|吧+|呢|嘛+|呃+|哦+|唉+|"
+    r"我想说的是|我觉得|就是说|其实|就是说呢|对吧|是不是|这样子?|这么一个|这样的一个|之类的|诸如此类的东西?)"
+)
+
+
+def _normalize_spoken(s):
+    if not s:
+        return ""
+    t = re.sub(r"\s+", " ", str(s)).strip()
+    # remove common filler/discourse markers (heuristic, may be imperfect)
+    for _ in range(2):
+        t = _FILLER_RE.sub("", t)
+        t = re.sub(r"\s+", " ", t).strip(" ，,。.!！？?；;：:·-—")
+    t = re.sub(r"([，,]){2,}", "，", t)
+    t = re.sub(r"^(好的|OK|ok|好)[，,\s]*", "", t)
+    return t.strip(" ，,。.!！？?；;：:·-—")
+
+
+def _sentence_key(s):
+    t = _normalize_spoken(s)
+    t = re.sub(r"[\s`*_~#>\[\]\(\)（）【】\"'“”‘’、，,。.!！？?；;：:·\-—]", "", t)
+    return t[:40]
+
+
+def _condense_point(s, limit=70):
+    t = _normalize_spoken(s)
+    if not t:
+        t = re.sub(r"\s+", " ", str(s or "")).strip()
+    t = t.strip(" ，,。.!！？?；;：:·-—")
+    if len(t) > limit:
+        t = t[: limit - 1].rstrip(" ，,；;：:") + "…"
+    return t
+
+
+def _select_representative_sentences(text, limit=6):
+    # pick diverse, information-bearing sentences from across the transcript (not just the first few)
+    sents = _split_sentences(text)
+    scored = []
+    for idx, s in enumerate(sents):
+        norm = _normalize_spoken(s)
+        plain = re.sub(r"[\s\W_]+", "", norm, flags=re.UNICODE)
+        if len(plain) < 6:
             continue
-        key = plain[:24]
-        if key in seen:
+        # prefer sentences with substantive content; lightly penalize very short/very long
+        score = len(plain)
+        if re.search(r"(因为|所以|为了|希望|想要|可以|能够|需要|问题|困难|方法|工具|目的|记录|整理|总结|提高|帮助|使用)", norm):
+            score += 8
+        scored.append((idx, s, norm, score))
+    if not scored:
+        return []
+    # sample across document: early/middle/late buckets
+    n = len(scored)
+    picks, used = [], set()
+    if n <= limit:
+        candidates = scored
+    else:
+        buckets = [scored[: max(1, n // 3)], scored[max(1, n // 3): max(2, 2 * n // 3)], scored[max(2, 2 * n // 3):]]
+        candidates = []
+        # take best from each bucket first, then fill by score
+        for b in buckets:
+            if b:
+                candidates.append(max(b, key=lambda x: x[3]))
+        for item in sorted(scored, key=lambda x: (-x[3], x[0])):
+            if item not in candidates:
+                candidates.append(item)
+    for idx, s, norm, _ in candidates:
+        k = _sentence_key(s)
+        if not k or k in used:
+            continue
+        # avoid near-duplicate by prefix overlap
+        if any(k[:18] and k[:18] == u[:18] for u in used):
+            continue
+        used.add(k)
+        picks.append((idx, s, norm))
+        if len(picks) >= limit:
+            break
+    picks.sort(key=lambda x: x[0])
+    return [p[1] for p in picks]
+
+
+def _pick_points(text, limit=5):
+    # heuristic "analysis" baseline: select representative points across the talk and condense wording
+    reps = _select_representative_sentences(text, limit=max(limit, 6))
+    points, seen = [], set()
+    source = reps or _split_sentences(text)
+    for s in source:
+        key = _sentence_key(s)
+        if not key or key in seen:
+            continue
+        plain = re.sub(r"[\s\W_]+", "", _normalize_spoken(s) or s, flags=re.UNICODE)
+        if len(plain) < 6:
             continue
         seen.add(key)
-        # trim to readable length
-        p = s if len(s) <= 90 else (s[:88].rstrip() + "…")
-        points.append(p)
+        p = _condense_point(s, limit=72)
+        if p:
+            points.append(p)
         if len(points) >= limit:
             break
     return points
@@ -303,28 +386,33 @@ def make_auto_summary(meeting):
     date_str = dt.strftime("%Y-%m-%d %H:%M（+08:00）") if dt else ""
     points = _pick_points(text, limit=5)
     if text:
-        # heuristic extractive baseline (not an LLM understanding summary): keep concise, prefer full sentences
-        if len(text) <= 320:
-            summary_para = text
+        # heuristic baseline (not LLM understanding): synthesize a compact overview from representative parts
+        reps = _select_representative_sentences(text, limit=4)
+        parts = []
+        for s in (reps or _split_sentences(text)):
+            c = _condense_point(s, limit=60)
+            if c:
+                parts.append(c)
+            if len(parts) >= 4:
+                break
+        # de-dup condensed parts
+        deduped, seen_k = [], set()
+        for p in parts:
+            k = re.sub(r"[\s\W_]+", "", p, flags=re.UNICODE)[:24]
+            if not k or k in seen_k:
+                continue
+            seen_k.add(k)
+            deduped.append(p)
+        core = "；".join(deduped[:3]).strip("； ")
+        if core:
+            summary_para = f"本次语音主要围绕：{core}。"
+            if len(text) > 180:
+                summary_para += "（启发式整理，详见要点与原始转写）"
         else:
-            picked, total = [], 0
-            for s in _split_sentences(text):
-                seg = s.strip()
-                if not seg:
-                    continue
-                add = len(seg) + (1 if picked else 0)
-                if picked and total + add > 320:
-                    break
-                picked.append(seg)
-                total += add
-                if total >= 260:
-                    break
-            summary_para = " ".join(picked).strip() if picked else text[:318].rstrip()
-            if len(summary_para) > 320:
-                summary_para = summary_para[:318].rstrip() + "…"
-            elif len(summary_para) < len(text):
-                if not summary_para.endswith(("。", "！", "？", "!", "?", "…")):
-                    summary_para += "…"
+            norm = _normalize_spoken(text)
+            summary_para = (norm[:200] + "…") if len(norm) > 200 else (norm or "（未识别到有效转写内容，请查看原始转写/录音）")
+        if len(summary_para) > 320:
+            summary_para = summary_para[:318].rstrip() + "…"
     else:
         summary_para = "（未识别到有效转写内容，请查看原始转写/录音）"
     todos = _extract_action_items(text)
