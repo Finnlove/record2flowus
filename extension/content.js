@@ -16,12 +16,30 @@
   function send(type, payload) {
     return new Promise((resolve) => {
       try {
+        if (typeof chrome === "undefined" || !chrome.runtime || typeof chrome.runtime.sendMessage !== "function") {
+          resolve({ ok: false, error: "扩展连接已失效", fix: "请刷新当前 FlowUs 页面（如刚重载/更新了扩展）后重试。" });
+          return;
+        }
         chrome.runtime.sendMessage({ type, payload }, (res) => {
-          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-          else resolve(res || { ok: false, error: "no response" });
+          const lastErr = chrome.runtime && chrome.runtime.lastError ? chrome.runtime.lastError.message : "";
+          if (lastErr) {
+            const msg = String(lastErr);
+            if (msg.includes("Extension context invalidated") || msg.includes("Receiving end does not exist")) {
+              resolve({ ok: false, error: "扩展连接已失效", fix: "请刷新当前 FlowUs 页面；若仍失败，请在 chrome://extensions 重载扩展后再刷新页面。" });
+            } else {
+              resolve({ ok: false, error: msg });
+            }
+            return;
+          }
+          resolve(res || { ok: false, error: "no response" });
         });
       } catch (e) {
-        resolve({ ok: false, error: String(e) });
+        const msg = String(e && e.message ? e.message : e);
+        if (msg.includes("Extension context invalidated")) {
+          resolve({ ok: false, error: "扩展连接已失效", fix: "请刷新当前 FlowUs 页面后重试。" });
+        } else {
+          resolve({ ok: false, error: msg });
+        }
       }
     });
   }
