@@ -230,12 +230,12 @@ def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, m
 
     basic_items = [rt(x) for x in (secs["basic"] or [f"会议 {mid}", date_str, f"时长 {dur_str}"])]
     left_children = [callout("基本信息", "🗂️", bg="gray", children=bullet(basic_items) if basic_items else [para("（无）")])]
-    left_children.append(callout("摘要", "🧾", bg="light_yellow", children=[para(secs["summary"] or "（待补充摘要）")]))
-    point_items = [rt(p) for p in (secs["points"] or ["（待补充要点）"])]
+    left_children.append(callout("摘要", "🧾", bg="light_yellow", children=[para(secs["summary"] or "（未识别到有效摘要，请参考原始转写）")]))
+    point_items = [rt(p) for p in (secs["points"] or ["（未识别到明确要点，请参考原始转写）"])]
     right_children = [callout("要点", "💡", bg="light_green", children=bullet(point_items))]
     blocks.append(column_list([(1, left_children), (1, right_children)]))
 
-    todos = secs["todos"] or ["复核转写与录音并补充关键信息", "提炼可执行行动项并归档"]
+    todos = secs["todos"] or ["（未识别到明确待办，可根据内容自行补充）"]
     blocks.append(callout("可行动项 / 后续计划", "✅", bg="light_red", children=[todo(t) for t in todos]))
     blocks.append(divider())
 
@@ -280,7 +280,11 @@ def main():
         with open(args.summary_file, "r", encoding="utf-8") as f:
             summary_text = f.read().strip()
     else:
-        summary_text = "## 语音笔记整理\n### 摘要\n" + (meeting.get("transcript") or "")[:400]
+        transcript = meeting.get("transcript") or ""
+        clean = re.sub(r"^#{1,6}\s+.*$", "", transcript, flags=re.M)
+        clean = re.sub(r"\*\*\d{1,2}:\d{2}(?::\d{2})?\s+[^*\n]+\*\*\s*", "", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        summary_text = "## 语音笔记整理\n### 摘要\n" + (clean[:400] if clean else "（未识别到有效转写内容）") + "\n### 要点\n- （未识别到明确要点，请参考原始转写）\n### 可行动项\n- （未识别到明确待办，可根据内容自行补充）"
 
     if args.page_id:
         page_id = _validate_uuid(args.page_id, "page-id")

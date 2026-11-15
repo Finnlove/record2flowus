@@ -164,48 +164,139 @@ def load_meeting_artifacts(mid):
     return {"id": mid, "dir": d, "manifest": m, "transcript": transcript, "wav": wav, "transcript_path": transcript_md}
 
 
+def _strip_transcript_prefix(line):
+    s = line.strip()
+    if not s:
+        return ""
+    # drop markdown headings like "# Meeting – 2:23 PM" or "## Transcript"
+    if re.match(r"^#{1,6}\s+", s):
+        if re.match(r"^#{1,6}\s*(transcript|转写|原始转写)\b", s, re.I):
+            return ""
+        # meeting title heading - usually noise for summary
+        if re.match(r"^#{1,6}\s*meeting\b", s, re.I):
+            return ""
+    # speaker/timestamp formats: "**00:00 You** text", "00:00 You  text", "**Speaker** · 00:00"
+    s = re.sub(r"^\*\*\d{1,2}:\d{2}(?::\d{2})?\s+[^*\n]+\*\*\s*", "", s)
+    s = re.sub(r"^\d{1,2}:\d{2}(?::\d{2})?\s+[A-Za-z0-9_\u4e00-\u9fff]+\s*[：:·\-]?\s*", "", s)
+    s = re.sub(r"^\*\*[^*\n]+\*\*\s*·\s*\d{1,2}:\d{2}(?::\d{2})?\s*", "", s)
+    s = re.sub(r"^\[[^\]\n]{1,20}\]\s*", "", s)
+    return s.strip()
+
+
 def extract_transcript_text(transcript_md):
-    body = transcript_md
-    m = re.search(r"^## Transcript\s*$", transcript_md, re.M)
+    body = transcript_md or ""
+    m = re.search(r"^##\s*Transcript\s*$", body, re.M | re.I)
     if m:
-        body = transcript_md[m.end():].strip()
-    lines = []
-    for line in body.splitlines():
-        s = line.strip()
-        if not s or re.match(r"^\*\*.+\*\*\s*·\s*\d", s):
+        body = body[m.end():].strip()
+    cleaned, seen = [], set()
+    for raw in body.splitlines():
+        s = _strip_transcript_prefix(raw)
+        if not s:
             continue
-        lines.append(s)
-    return "\n".join(lines).strip()
+        # skip pure separators/metadata remnants
+        if re.fullmatch(r"[-_=*~\s]{3,}", s):
+            continue
+        key = re.sub(r"\s+", "", s)
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(s)
+    text = "\n".join(cleaned).strip()
+    # collapse excessive whitespace
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text
+
+
+def _split_sentences(text):
+    if not text:
+        return []
+    parts = re.split(r"(?<=[。！？!?；;])\s+|\n+", text)
+    out = []
+    for p in parts:
+        s = re.sub(r"\s+", " ", p).strip(" \t\r\n-•·")
+        if not s:
+            continue
+        out.append(s)
+    return out
+
+
+def _pick_points(text, limit=5):
+    points, seen = [], set()
+    for s in _split_sentences(text):
+        # ignore very short or non-informative fragments
+        plain = re.sub(r"[\s`*_~#>\[\]\(\)]", "", s)
+        if len(plain) < 8:
+            continue
+        key = plain[:24]
+        if key in seen:
+            continue
+        seen.add(key)
+        # trim to readable length
+        p = s if len(s) <= 90 else (s[:88].rstrip() + "…")
+        points.append(p)
+        if len(points) >= limit:
+            break
+    return points
+
+
+def _extract_action_items(text):
+    if not text:
+        return []
+    keywords = ("需要", "记得", "待办", "TODO", "todo", "下一步", "跟进", "安排", "计划", "补充", "确认", "修复", "处理", "联系", "提交", "发送", "整理")
+    todos, seen = [], set()
+    for s in _split_sentences(text):
+        if not any(k in s for k in keywords):
+            continue
+        # avoid meta/system phrases
+        if "幂等" in s and "meeting id" in s.lower():
+            continue
+        item = s.strip(" 。！？!?；;")
+        if len(item) > 60:
+            item = item[:58].rstrip() + "…"
+        key = re.sub(r"\s+", "", item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        todos.append(item)
+        if len(todos) >= 5:
+            break
+    return todos
 
 
 def make_auto_summary(meeting):
-    transcript = meeting["transcript"]
+    transcript = meeting.get("transcript") or ""
     text = extract_transcript_text(transcript)
-    m = meeting["manifest"]
+    m = meeting.get("manifest") or {}
     dur_s = int((m.get("duration_ms") or 0) / 1000)
     mm, ss = divmod(dur_s, 60)
     created_ms = m.get("created_at_ms") or 0
     dt = datetime.fromtimestamp(created_ms / 1000, tz=timezone(timedelta(hours=8))) if created_ms else None
     date_str = dt.strftime("%Y-%m-%d %H:%M（+08:00）") if dt else ""
-    raw = re.split(r"[。！？!?]\s*", text)
-    raw = [x.strip() for x in raw if len(x.strip()) >= 6]
-    points, seen = [], set()
-    for s in raw:
-        k = s[:20]
-        if k in seen:
-            continue
-        seen.add(k)
-        points.append(s[:80])
-        if len(points) >= 5:
-            break
-    summary_para = (text[:320] + ("…" if len(text) > 320 else "")) if text else "（无有效转写内容）"
-    todos = ["复核转写要点与原始录音，补充关键信息", "根据本次内容提炼可执行行动项", "按 meeting id 做幂等归档"]
-    md = ["## 语音笔记整理（自动生成）", "### 基本信息", f"- 会议ID：{meeting['id']}", f"- 时间：{date_str}", f"- 时长：{mm:02d}:{ss:02d}", "- 转写：Hex 本地 ASR", "### 摘要", summary_para, "### 要点"]
-    for p in (points or ["（待补充要点）"]):
+    points = _pick_points(text, limit=5)
+    if text:
+        summary_para = text if len(text) <= 320 else (text[:318].rstrip() + "…")
+    else:
+        summary_para = "（未识别到有效转写内容，请查看原始转写/录音）"
+    todos = _extract_action_items(text)
+    md = [
+        "## 语音笔记整理（自动生成）",
+        "### 基本信息",
+        f"- 会议ID：{meeting.get('id', '')}",
+        f"- 时间：{date_str}",
+        f"- 时长：{mm:02d}:{ss:02d}",
+        "- 转写：Hex 本地 ASR",
+        "### 摘要",
+        summary_para,
+        "### 要点",
+    ]
+    for p in (points or ["（未识别到明确要点，请参考原始转写）"]):
         md.append(f"- {p}")
     md.append("### 可行动项")
-    for t in todos:
-        md.append(f"- {t}")
+    if todos:
+        for t in todos:
+            md.append(f"- {t}")
+    else:
+        md.append("- （未从转写中识别到明确待办，可根据内容自行补充）")
     return "\n".join(md), points
 
 
@@ -217,25 +308,24 @@ def rt_node(text):
 
 
 def make_auto_mindmap(meeting, points):
-    m = meeting["manifest"]
+    m = meeting.get("manifest") or {}
     dur_s = int((m.get("duration_ms") or 0) / 1000)
     mm, ss = divmod(dur_s, 60)
-    title_text = f"语音笔记导图 {meeting['id']}（{mm:02d}:{ss:02d}）"
-    point_children = [{"rich_text": rt_node(p[:40])} for p in (points[:6] or ["待补充要点"])]
+    title_text = f"语音笔记导图 {meeting.get('id', '')}（{mm:02d}:{ss:02d}）"
+    point_children = [{"rich_text": rt_node(p[:40])} for p in (points[:6] or ["（未识别到明确要点）"])]
     return {
         "title": rt_node(title_text),
         "settings": {"layout": "both", "line_style": "curved", "branch_color": "gray", "sibling_node_alignment": True},
         "nodes": [
             {"rich_text": rt_node("基本信息"), "children": [
-                {"rich_text": rt_node(f"会议ID: {meeting['id']}")},
+                {"rich_text": rt_node(f"会议ID: {meeting.get('id', '')}")},
                 {"rich_text": rt_node(f"时长: {mm:02d}:{ss:02d}")},
                 {"rich_text": rt_node("来源: Hex 本地录音+ASR")},
             ]},
             {"rich_text": rt_node("核心要点"), "children": point_children},
-            {"rich_text": rt_node("行动与归档"), "children": [
-                {"rich_text": rt_node("复核转写并补充关键信息")},
-                {"rich_text": rt_node("提炼待办与结论")},
-                {"rich_text": rt_node("归档录音/转写/摘要")},
+            {"rich_text": rt_node("后续"), "children": [
+                {"rich_text": rt_node("复核原始转写与录音")},
+                {"rich_text": rt_node("按需补充待办与结论")},
             ]},
         ]
     }
