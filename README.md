@@ -61,6 +61,19 @@ It supports:
 
 ## Configuration
 
+**Recommended (first-time setup):** run the setup wizard, then doctor:
+
+```powershell
+setup.cmd
+# or: python scripts/setup.py
+doctor.cmd
+# or: python scripts/doctor.py
+```
+
+The wizard creates/updates `config.local.json` (gitignored), auto-detects Hex where possible, generates a strong `bridge_token` when needed, and guides you through port/origin settings without overwriting existing secrets unless you confirm.
+
+**Manual alternative:**
+
 1. Copy `config.example.json` to `config.local.json` (**recommended**, gitignored). `config.json` is also supported but gitignored to reduce accidental commits — prefer `config.local.json` for personal settings.
 2. Adjust values:
 
