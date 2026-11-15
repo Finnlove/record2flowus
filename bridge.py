@@ -12,6 +12,17 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+# local helper (scripts/archive_store.py)
+BASE_DIR_IMPORT = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR_IMPORT not in sys.path:
+    sys.path.insert(0, BASE_DIR_IMPORT)
+try:
+    from scripts.archive_store import ArchiveStore, make_archive_id, default_db_path
+except Exception:
+    ArchiveStore = None
+    make_archive_id = None
+    default_db_path = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_BODY_SIZE = 8 * 1024
 READ_TIMEOUT = 10
@@ -67,6 +78,8 @@ PORT = int(os.environ.get("BRIDGE_PORT") or CFG.get("bridge_port") or 27123)
 BRIDGE_TOKEN = str(os.environ.get("BRIDGE_TOKEN") or CFG.get("bridge_token") or "").strip()
 ALLOWED_ORIGIN = str(os.environ.get("BRIDGE_ALLOWED_ORIGIN") or CFG.get("bridge_allowed_origin") or "").strip()
 EXPECTED_HOST = f"127.0.0.1:{PORT}"
+LEDGER_DB = os.environ.get("ARCHIVE_LEDGER_DB") or CFG.get("archive_ledger_db") or (default_db_path() if default_db_path else "")
+LEDGER = ArchiveStore(LEDGER_DB) if (ArchiveStore and LEDGER_DB) else None
 
 state = {
     "status": "idle",  # idle|starting|recording|stopping|processing|done|error
@@ -396,11 +409,13 @@ def detect_new_meeting(before_ids, timeout_s=20):
     return None
 
 
-def process_and_upload(meeting_id, page_id):
+def process_and_upload(meeting_id, page_id, archive_id=None):
     meeting = load_meeting_artifacts(meeting_id)
     summary_md, points = make_auto_summary(meeting)
     mm_body = make_auto_mindmap(meeting, points)
-    tmp = os.path.join(tempfile.gettempdir(), "hex-flowus-voice-note")
+    # per-run isolated temp workspace
+    run_id = (archive_id or meeting_id or "run").replace(":", "_").replace("/", "_")
+    tmp = os.path.join(tempfile.gettempdir(), "hex-flowus-voice-note", run_id + "_" + uuid.uuid4().hex[:8])
     os.makedirs(tmp, exist_ok=True)
     sum_path = os.path.join(tmp, f"auto_summary_{meeting_id}.md")
     mm_path = os.path.join(tmp, f"auto_mindmap_{meeting_id}.json")
@@ -410,8 +425,16 @@ def process_and_upload(meeting_id, page_id):
         json.dump(mm_body, f, ensure_ascii=False)
     if not os.path.isfile(SYNC_SCRIPT):
         raise RuntimeError(f"sync script not found: {SYNC_SCRIPT}")
+
     cmd = [sys.executable, SYNC_SCRIPT, "--meeting-id", meeting_id, "--page-id", page_id,
-           "--summary-file", sum_path, "--mindmap-json", mm_path, "--meetings-dir", HEX_MEETINGS]
+           "--summary-file", sum_path, "--mindmap-json", mm_path, "--meetings-dir", HEX_MEETINGS,
+           "--work-dir", tmp]
+    if archive_id:
+        cmd += ["--archive-id", archive_id, "--skip-if-present"]
+
+    if LEDGER and archive_id:
+        LEDGER.update_steps(archive_id, {"prepare": {"ok": True, "work_dir": tmp}, "sync_started": {"ts": time.time()}})
+
     r = run(cmd, timeout=600)
     out = (r.stdout or "") + "\n" + (r.stderr or "")
     result = None
@@ -423,9 +446,32 @@ def process_and_upload(meeting_id, page_id):
                 break
             except Exception:
                 pass
-    if r.returncode != 0 and not (result and result.get("ok")):
-        raise RuntimeError(out[-2000:])
-    return result or {"ok": True, "raw": out[-1000:]}
+
+    # classify result
+    if result and result.get("skipped") and result.get("reason") == "marker_present":
+        if LEDGER and archive_id:
+            LEDGER.update_steps(archive_id, {"remote_marker": {"present": True}, "sync": {"skipped": True}})
+        return {"ok": True, "skipped": True, "archive_id": archive_id, "result": result}
+
+    if r.returncode == 0 and result and result.get("ok"):
+        if LEDGER and archive_id:
+            LEDGER.update_steps(archive_id, {
+                "upload": result.get("audio"),
+                "mindmap": {"id": result.get("mindmap_id"), "url": result.get("mindmap_url")},
+                "append": {"ok": True},
+                "verify": {"marker_verified": result.get("marker_verified")},
+                "sync": {"ok": True},
+            })
+        return result
+
+    # uncertain cases: append failed mid-way or process interrupted after partial writes
+    uncertain = bool(result and (result.get("uncertain") or result.get("step") == "append"))
+    if LEDGER and archive_id:
+        LEDGER.update_steps(archive_id, {"sync": {"ok": False, "uncertain": uncertain, "returncode": r.returncode, "tail": out[-1500:]}})
+    err = RuntimeError(out[-2000:] or "sync failed")
+    setattr(err, "uncertain", uncertain)
+    setattr(err, "result", result)
+    raise err
 
 
 def worker_start(page_id, page_title, page_url):
@@ -458,6 +504,8 @@ def worker_start(page_id, page_title, page_url):
 
 
 def worker_stop_and_process():
+    archive_id = None
+    claim_worker = None
     try:
         with lock:
             mid = state.get("meeting_id")
@@ -475,16 +523,59 @@ def worker_stop_and_process():
         with lock:
             state.update({"meeting_id": mid, "status": "processing", "message": "waiting for transcript"})
         wait_for_meeting_complete(mid, timeout_s=360)
-        with lock:
-            state["message"] = "uploading to FlowUs"
+
         if not page_id:
             raise RuntimeError("missing target page_id")
-        result = process_and_upload(mid, page_id)
+        if not _valid_page_id(str(page_id)):
+            raise RuntimeError("invalid target page_id")
+
+        # idempotency: archive identity per meeting+target page (append mode)
+        if make_archive_id:
+            archive_id = make_archive_id(mid, page_id, mode="append")
+        if LEDGER and archive_id:
+            claim = LEDGER.claim(archive_id, mid, target_page_id=page_id)
+            if not claim.get("ok"):
+                reason = claim.get("reason")
+                if reason == "already_done":
+                    with lock:
+                        state.update({"status": "done", "message": "already archived (skipped)", "result": {"ok": True, "skipped": True, "reason": reason, "archive_id": archive_id}})
+                    return
+                if reason == "needs_review":
+                    with lock:
+                        state.update({"status": "error", "error": "archive needs review before retry (possible prior partial write)", "message": "needs review"})
+                    return
+                if reason == "already_running":
+                    with lock:
+                        state.update({"status": "error", "error": "same archive is already running", "message": "busy"})
+                    return
+                # default: treat as non-runnable
+                with lock:
+                    state.update({"status": "error", "error": f"archive claim rejected: {reason}", "message": "busy"})
+                return
+            claim_worker = claim.get("worker_id")
+
+        with lock:
+            state["message"] = "uploading to FlowUs"
+            if archive_id:
+                state["archive_id"] = archive_id
+
+        result = process_and_upload(mid, page_id, archive_id=archive_id)
         with lock:
             state.update({"status": "done", "message": "uploaded", "result": result})
+        if LEDGER and archive_id:
+            LEDGER.mark_done(archive_id, result=result)
     except Exception as e:
+        uncertain = bool(getattr(e, "uncertain", False))
+        if LEDGER and archive_id:
+            if uncertain:
+                LEDGER.mark_needs_review(archive_id, str(e), result=getattr(e, "result", None))
+            else:
+                LEDGER.mark_error(archive_id, str(e))
         with lock:
-            state.update({"status": "error", "error": str(e), "message": "processing failed"})
+            if uncertain:
+                state.update({"status": "error", "error": "write result uncertain; manual review required before retry: " + str(e), "message": "needs review"})
+            else:
+                state.update({"status": "error", "error": str(e), "message": "processing failed"})
 
 
 def _is_flowus_url(url):
@@ -506,12 +597,17 @@ def _valid_page_id(pid):
 
 def _public_state():
     with lock:
-        return {
+        st = {
             "status": state.get("status"),
             "message": state.get("message") or "",
             "has_error": bool(state.get("error")),
             "page_bound": bool(state.get("page_id")),
         }
+        if state.get("archive_id"):
+            st["archive_id"] = state.get("archive_id")
+        if state.get("meeting_id") and state.get("status") in ("recording", "stopping", "processing", "done"):
+            st["meeting_bound"] = True
+        return st
 
 
 def _authorized(handler):
@@ -692,7 +788,7 @@ class Handler(BaseHTTPRequestHandler):
                 if state.get("status") in ("recording", "stopping", "processing", "starting"):
                     self._send(409, {"ok": False, "error": "busy"})
                     return
-                state.update({"status": "idle", "message": "", "error": None, "result": None, "meeting_id": None})
+                state.update({"status": "idle", "message": "", "error": None, "result": None, "meeting_id": None, "archive_id": None})
             self._send(200, {"ok": True})
         else:
             self._reject(404, "not found")

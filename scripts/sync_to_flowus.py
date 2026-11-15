@@ -55,9 +55,20 @@ def run_flowus(args, body_path=None):
     out = (r.stdout or "").strip()
     err = (r.stderr or "").strip()
     try:
-        return json.loads(out or err)
+        data = json.loads(out or err)
     except Exception:
         raise RuntimeError(f"flowus failed: {err or out}")
+    return data, r.returncode, out, err
+
+
+def run_flowus_ok(args, body_path=None):
+    data, code, out, err = run_flowus(args, body_path)
+    if code != 0 or not isinstance(data, dict) or not data.get("ok", True):
+        # flowus --json usually returns {"ok":false,...} on error
+        if isinstance(data, dict) and data.get("ok") is False:
+            return data, False
+        raise RuntimeError(f"flowus command failed (code={code}): {err or out}")
+    return data, True
 
 
 def load_meeting(meeting_id=None, meetings_dir=None):
@@ -205,7 +216,60 @@ def parse_summary_sections(summary_text):
     return out
 
 
-def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, mindmap_url):
+def marker_text(archive_id):
+    return f"ARCHIVE_ID:{archive_id}"
+
+
+def _safe_token(s):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", str(s or ""))[:80] or "run"
+
+
+def make_tmp_dir(base_hint="vn"):
+    d = os.path.join(tempfile.gettempdir(), f"{base_hint}_{_safe_token(uuid.uuid4().hex)}")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def page_contains_marker(page_id, archive_id):
+    if not archive_id:
+        return False, None
+    m = marker_text(archive_id)
+    # best-effort: markdown is simpler to search than paginated raw blocks
+    try:
+        data, ok = run_flowus_ok(["--json", "markdown", "get", page_id])
+        if not ok:
+            return False, data
+        md = ((data or {}).get("data") or {}).get("markdown") or ""
+        if m in md:
+            return True, "markdown"
+    except Exception:
+        pass
+    # fallback: scan block children text
+    try:
+        cursor = None
+        while True:
+            args = ["--json", "block", "children", page_id, "--page-size", "100"]
+            if cursor:
+                args += ["--start-cursor", cursor]
+            data, ok = run_flowus_ok(args)
+            if not ok:
+                return False, data
+            payload = (data or {}).get("data") or {}
+            for b in payload.get("results") or []:
+                blob = json.dumps(b, ensure_ascii=False)
+                if m in blob:
+                    return True, "blocks"
+            if not payload.get("has_more"):
+                break
+            cursor = payload.get("next_cursor")
+            if not cursor:
+                break
+    except Exception as e:
+        return False, {"error": str(e)}
+    return False, None
+
+
+def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, mindmap_url, archive_id=None):
     m = meeting["manifest"]
     mid = meeting["id"]
     created_ms = m.get("created_at_ms") or 0
@@ -223,6 +287,8 @@ def build_beautified_blocks(meeting, transcript, summary_text, oss_name, size, m
         rt("转写：", bold=True) + rt("本地 ASR（Hex）"),
         rt("来源：", bold=True) + rt(f"Hex 本地会议录音 · {m.get('title') or 'Meeting'}"),
     ]
+    if archive_id:
+        meta_items.append(rt("归档标识：", bold=True) + rt(marker_text(archive_id), code=True))
     blocks = []
     blocks.append(callout("会议速览", "📋", bg="light_blue", title_color="blue", children=bullet(meta_items)))
     blocks.append(divider())
@@ -267,7 +333,13 @@ def main():
     ap.add_argument("--mindmap-json", help="Path to FlowUs mindmap create JSON body")
     ap.add_argument("--no-mindmap", action="store_true")
     ap.add_argument("--plain", action="store_true", help="Disable beautified layout")
+    ap.add_argument("--archive-id", help="Stable archive id for idempotency marker and remote verification")
+    ap.add_argument("--skip-if-present", action="store_true", help="If archive marker already exists on target page, skip writes")
+    ap.add_argument("--work-dir", help="Directory for temporary request payload files (unique per run recommended)")
     args = ap.parse_args()
+
+    work_dir = args.work_dir or make_tmp_dir("vn_sync")
+    os.makedirs(work_dir, exist_ok=True)
 
     meeting = load_meeting(args.meeting_id, args.meetings_dir)
     m = meeting["manifest"]
@@ -286,6 +358,7 @@ def main():
         clean = re.sub(r"\s+", " ", clean).strip()
         summary_text = "## 语音笔记整理\n### 摘要\n" + (clean[:400] if clean else "（未识别到有效转写内容）") + "\n### 要点\n- （未识别到明确要点，请参考原始转写）\n### 可行动项\n- （未识别到明确待办，可根据内容自行补充）"
 
+    page_created = False
     if args.page_id:
         page_id = _validate_uuid(args.page_id, "page-id")
         page_url = f"https://flowus.cn/{page_id}"
@@ -302,34 +375,47 @@ def main():
             database_id = _validate_uuid(args.database_id, "database-id")
             page_body = {"parent": {"type": "database_id", "database_id": database_id},
                          "title": [{"type": "text", "text": {"content": title}}], "icon": icon}
-        tmp = os.path.join(tempfile.gettempdir(), "vn_page.json")
+        tmp = os.path.join(work_dir, "page.json")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(page_body, f, ensure_ascii=False)
-        res = run_flowus(["--json", "page", "create"], tmp)
-        if not res.get("ok"):
+        res, ok = run_flowus_ok(["--json", "page", "create"], tmp)
+        if not ok:
             print(json.dumps(res, ensure_ascii=False, indent=2)); sys.exit(1)
         page_id = res["data"]["id"]
         page_url = res["data"].get("url") or f"https://flowus.cn/{page_id}"
+        page_created = True
         print("PAGE_OK", page_id, page_url)
 
-    up = run_flowus(["--json", "file", "upload", "--parent-page", page_id, meeting["wav"]])
-    if not up.get("ok"):
+    # Best-effort remote idempotency check (append target known)
+    if args.archive_id and args.skip_if_present:
+        found, where = page_contains_marker(page_id, args.archive_id)
+        if found:
+            print("SKIP_ALREADY_ARCHIVED", args.archive_id, where or "")
+            print(json.dumps({"ok": True, "skipped": True, "reason": "marker_present", "archive_id": args.archive_id,
+                              "page_id": page_id, "page_url": page_url, "meeting_id": meeting["id"]}, ensure_ascii=False))
+            return
+        # if check inconclusive (where is dict/error), we proceed cautiously (no false-skip)
+
+    # Upload audio
+    up, ok = run_flowus_ok(["--json", "file", "upload", "--parent-page", page_id, meeting["wav"]])
+    if not ok:
         print(json.dumps(up, ensure_ascii=False, indent=2)); sys.exit(1)
     oss_name = up["data"]["oss_name"]
     size = up["data"].get("size", 0)
     print("UPLOAD_OK", oss_name, size)
 
+    # Mindmap (optional)
     mindmap_url = None
     mindmap_id = None
     if (not args.no_mindmap) and args.mindmap_json and os.path.isfile(args.mindmap_json):
         with open(args.mindmap_json, "r", encoding="utf-8") as f:
             mm_body = json.load(f)
         mm_body["parent"] = {"page_id": page_id}
-        mp = os.path.join(tempfile.gettempdir(), "vn_mm.json")
+        mp = os.path.join(work_dir, "mindmap.json")
         with open(mp, "w", encoding="utf-8") as f:
             json.dump(mm_body, f, ensure_ascii=False)
-        mr = run_flowus(["--json", "mindmap", "create"], mp)
-        if mr.get("ok"):
+        mr, ok = run_flowus_ok(["--json", "mindmap", "create"], mp)
+        if ok:
             md = mr["data"]
             mindmap_id = md.get("id")
             mindmap_url = md.get("url") or (f"https://flowus.cn/{mindmap_id}" if mindmap_id else None)
@@ -337,22 +423,49 @@ def main():
         else:
             print("MINDMAP_FAIL", json.dumps(mr, ensure_ascii=False))
 
+    # Build blocks (include archive marker for idempotency verification)
     if args.plain:
-        children = [para(f"会议 {meeting['id']} {date_str}"), para(summary_text), para((meeting.get("transcript") or "")[:3000]), file_block(oss_name, size)]
+        children = []
+        if args.archive_id:
+            children.append(para(f"归档标识：{marker_text(args.archive_id)}"))
+        children += [para(f"会议 {meeting['id']} {date_str}"), para(summary_text), para((meeting.get("transcript") or "")[:3000]), file_block(oss_name, size)]
     else:
-        children = build_beautified_blocks(meeting, meeting.get("transcript") or "", summary_text, oss_name, size, mindmap_url)
+        children = build_beautified_blocks(meeting, meeting.get("transcript") or "", summary_text, oss_name, size, mindmap_url, archive_id=args.archive_id)
 
+    # Append blocks
     for i in range(0, len(children), 80):
         batch = {"children": children[i:i+80]}
-        bp = os.path.join(tempfile.gettempdir(), f"vn_blocks_{i}.json")
+        bp = os.path.join(work_dir, f"blocks_{i}.json")
         with open(bp, "w", encoding="utf-8") as f:
             json.dump(batch, f, ensure_ascii=False)
-        ar = run_flowus(["--json", "block", "append", page_id], bp)
-        if not ar.get("ok"):
-            print("APPEND_FAIL", json.dumps(ar, ensure_ascii=False)); sys.exit(1)
+        ar, ok = run_flowus_ok(["--json", "block", "append", page_id], bp)
+        if not ok:
+            print("APPEND_FAIL", json.dumps(ar, ensure_ascii=False))
+            # cannot be sure if prior batches landed; caller should mark needs_review
+            print(json.dumps({"ok": False, "uncertain": True, "archive_id": args.archive_id, "page_id": page_id,
+                              "page_url": page_url, "meeting_id": meeting["id"], "step": "append", "error": ar}, ensure_ascii=False))
+            sys.exit(2)
     print("APPEND_OK", len(children))
-    print(json.dumps({"ok": True, "page_id": page_id, "page_url": page_url, "mindmap_id": mindmap_id, "mindmap_url": mindmap_url}, ensure_ascii=False))
+
+    # Post-verify marker presence when archive_id provided (best-effort)
+    verified = None
+    if args.archive_id:
+        found, where = page_contains_marker(page_id, args.archive_id)
+        verified = bool(found)
+        if not found:
+            print("VERIFY_WARN marker not confirmed on target page", json.dumps(where, ensure_ascii=False))
+
+    print(json.dumps({"ok": True, "skipped": False, "archive_id": args.archive_id, "page_id": page_id, "page_url": page_url,
+                      "meeting_id": meeting["id"], "mindmap_id": mindmap_id, "mindmap_url": mindmap_url,
+                      "audio": {"oss_name": oss_name, "size": size}, "page_created": page_created,
+                      "marker_verified": verified}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False))
+        sys.exit(1)
