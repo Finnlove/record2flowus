@@ -410,9 +410,14 @@ class Handler(BaseHTTPRequestHandler):
         origin = self._cors_origin()
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            vary = "Origin"
+            if self.headers.get("Access-Control-Request-Private-Network"):
+                vary = "Origin, Access-Control-Request-Private-Network"
+            self.send_header("Vary", vary)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            if self.headers.get("Access-Control-Request-Private-Network") == "true":
+                self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -456,10 +461,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         if origin:
             self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
+            vary = "Origin"
+            if self.headers.get("Access-Control-Request-Private-Network"):
+                vary = "Origin, Access-Control-Request-Private-Network"
+            self.send_header("Vary", vary)
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
             self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
             self.send_header("Access-Control-Max-Age", "600")
+            if self.headers.get("Access-Control-Request-Private-Network") == "true":
+                self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
 
     def _preflight(self):
