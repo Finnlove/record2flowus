@@ -77,9 +77,10 @@ It supports:
 ```
 
 Notes:
-- **`bridge_token` (required):** random secret used to authenticate all bridge API calls. Generate a strong value (e.g. 32+ random bytes/characters) and keep it private. You must set the same token in the browser extension options.
-- **`bridge_allowed_origin` (recommended/required for browser use):** the extension origin in the form `chrome-extension://<EXTENSION_ID>`. Find the extension ID on `chrome://extensions` after loading it. Requests with missing/mismatched `Origin` (when configured) are rejected.
-- **Security defaults:** the bridge binds only to `127.0.0.1`, validates the `Host` header, enforces request size/format limits, validates FlowUs page IDs/URLs and meeting/artifact paths, and returns a sanitized `/state`.
+- **`bridge_token` (required):** random secret used to authenticate all bridge API calls. Must be at least 32 characters (high-entropy, randomly generated). Keep it private and set the same value in the browser extension options.
+- **`bridge_allowed_origin` (required for browser use):** the extension origin in the form `chrome-extension://<EXTENSION_ID>`. Find the extension ID on `chrome://extensions` after loading it. When configured, requests with missing or mismatched `Origin` are rejected; browser extension calls must match this origin.
+- **Security defaults:** the bridge binds only to `127.0.0.1`, validates `Host` and `Origin`, requires `Authorization: Bearer <token>` and `Content-Type: application/json` for API requests, enforces request size/format limits, validates FlowUs page IDs/URLs and meeting/artifact paths, and returns a sanitized `/state`.
+- **Config safety:** invalid/unreadable `config.json` or `config.local.json` will stop startup with an explicit error (no silent fallback).
 - If `hex_exe` is empty, `bridge.py` attempts auto-detection under `%APPDATA%\hex\versions\*` and falls back to `hex`.
 - Environment variables can override config: `HEX_EXE`, `HEX_MEETINGS_DIR`, `HEX_EXPORT_DIR`, `SYNC_SCRIPT`, `BRIDGE_PORT`, `BRIDGE_TOKEN`, `BRIDGE_ALLOWED_ORIGIN`.
 - Do **not** commit `config.json`, `config.local.json`, tokens, cookies, or personal workspace IDs.
@@ -163,7 +164,7 @@ Useful options:
 
 ## Security notes
 
-This project controls local recording and writes to your FlowUs workspace. To reduce risk, the bridge enforces token authentication, loopback-only binding/host checks, extension-origin allowlisting (CORS), strict input validation (body size/type, FlowUs page ID/URL, meeting ID and artifact path confinement), and sanitized status responses. Keep your `bridge_token` secret, do not expose the bridge beyond localhost, and only load the extension from a trusted local copy.
+This project controls local recording and writes to your FlowUs workspace. To reduce risk, the bridge enforces token authentication (min 32 chars), loopback-only binding/host checks, strict extension-origin checks (including missing Origin rejection when configured), strict input validation (Content-Type/body size/format, FlowUs page ID/URL, meeting ID and artifact path confinement), and sanitized status responses. `scripts/sync_to_flowus.py` also validates target IDs and constrains manifest/export paths when run directly from the CLI. Keep your `bridge_token` secret, do not expose the bridge beyond localhost, and only load the extension from a trusted local copy.
 
 ## Troubleshooting
 

@@ -22,12 +22,19 @@ def load_config():
     cfg = {}
     for name in ("config.json", "config.local.json"):
         p = os.path.join(BASE_DIR, name)
-        if os.path.isfile(p):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    cfg.update(json.load(f) or {})
-            except Exception:
-                pass
+        if not os.path.isfile(p):
+            continue
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                raise ValueError("top-level JSON value must be an object")
+            cfg.update(data)
+        except Exception as e:
+            print(f"ERROR: failed to load config file '{p}': {e}", file=sys.stderr)
+            raise SystemExit(2)
     return cfg
 
 
@@ -417,8 +424,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _read_json(self):
         ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-        if ctype and ctype != "application/json":
-            raise ValueError("invalid content type")
+        if ctype != "application/json":
+            raise ValueError("content-type must be application/json")
         raw_len = self.headers.get("Content-Length")
         if raw_len is None:
             raise ValueError("missing content length")
@@ -443,14 +450,31 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("json object required")
         return data
 
+    def _send_preflight(self):
+        origin = self._cors_origin()
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+            self.send_header("Access-Control-Max-Age", "600")
+        self.end_headers()
+
     def _preflight(self):
         host = (self.headers.get("Host") or "").lower()
         if host != EXPECTED_HOST.lower():
             self._reject(403, "invalid host")
             return False
         origin = self.headers.get("Origin")
-        if origin and not self._cors_origin():
-            self._reject(403, "forbidden origin")
+        if ALLOWED_ORIGIN:
+            if not origin or origin != ALLOWED_ORIGIN:
+                self._reject(403, "forbidden origin")
+                return False
+        elif origin:
+            # No allowed origin configured: reject cross-origin browser requests by default.
+            self._reject(403, "origin not allowed")
             return False
         return True
 
@@ -466,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         if not self._preflight():
             return
-        self._send(204, {})
+        self._send_preflight()
 
     def do_GET(self):
         if not self._preflight():
@@ -544,8 +568,11 @@ if __name__ == "__main__":
     if not BRIDGE_TOKEN:
         print("ERROR: bridge_token is not configured. Set it in config.local.json (or BRIDGE_TOKEN env).", file=sys.stderr)
         sys.exit(2)
+    if len(BRIDGE_TOKEN) < 32:
+        print("ERROR: bridge_token is too short. Use a high-entropy random token with at least 32 characters.", file=sys.stderr)
+        sys.exit(2)
     if not ALLOWED_ORIGIN:
-        print("WARNING: bridge_allowed_origin is not configured; cross-origin browser requests will be rejected.", file=sys.stderr)
+        print("WARNING: bridge_allowed_origin is not configured; browser requests with Origin will be rejected.", file=sys.stderr)
     print(f"Bridge listening on http://{HOST}:{PORT}")
     print(f"HEX_EXE={HEX_EXE}")
     print(f"SYNC_SCRIPT={SYNC_SCRIPT}")

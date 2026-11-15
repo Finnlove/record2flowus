@@ -5,9 +5,46 @@ import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 
 HEX_MEETINGS_DEFAULT = os.path.join(os.environ.get("APPDATA", ""), "hex", "meetings")
+HEX_EXPORT_DIR = os.environ.get("HEX_EXPORT_DIR", "")
+UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _is_inside(path, base):
+    try:
+        real_path = os.path.realpath(path)
+        real_base = os.path.realpath(base)
+        return os.path.commonpath([real_path, real_base]) == real_base
+    except Exception:
+        return False
+
+
+def _validate_meeting_id(mid):
+    return isinstance(mid, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", mid) is not None
+
+
+def _validate_uuid(value, name):
+    if not isinstance(value, str) or UUID_RE.fullmatch(value) is None:
+        raise SystemExit(f"error: invalid {name}")
+    return value
+
+
+def _resolve_transcript_path(export_path, meeting_dir, meetings_dir):
+    if isinstance(export_path, str) and export_path.strip():
+        ep = os.path.normpath(export_path.strip())
+        allowed = [meeting_dir, meetings_dir]
+        if HEX_EXPORT_DIR:
+            allowed.append(HEX_EXPORT_DIR)
+        for base in allowed:
+            if base and _is_inside(ep, base) and os.path.isfile(ep):
+                return ep
+    fallback = os.path.join(meeting_dir, "transcript.md")
+    if os.path.isfile(fallback):
+        return fallback
+    return None
 
 
 def run_flowus(args, body_path=None):
@@ -24,12 +61,17 @@ def run_flowus(args, body_path=None):
 
 
 def load_meeting(meeting_id=None, meetings_dir=None):
-    meetings_dir = meetings_dir or os.environ.get("HEX_MEETINGS_DIR") or HEX_MEETINGS_DEFAULT
+    meetings_dir = os.path.normpath(meetings_dir or os.environ.get("HEX_MEETINGS_DIR") or HEX_MEETINGS_DEFAULT)
     if not os.path.isdir(meetings_dir):
         raise RuntimeError(f"meetings dir not found: {meetings_dir}")
+    if meeting_id and not _validate_meeting_id(meeting_id):
+        raise RuntimeError("invalid meeting id")
+
     dirs = [os.path.join(meetings_dir, d) for d in os.listdir(meetings_dir) if os.path.isdir(os.path.join(meetings_dir, d))]
     candidates = []
     for d in dirs:
+        if not _is_inside(d, meetings_dir):
+            continue
         mf = os.path.join(d, "manifest.json")
         if not os.path.isfile(mf):
             continue
@@ -39,7 +81,9 @@ def load_meeting(meeting_id=None, meetings_dir=None):
         except Exception:
             continue
         mid = m.get("id") or os.path.basename(d)
-        if meeting_id and mid != meeting_id:
+        if not _validate_meeting_id(str(mid)):
+            continue
+        if meeting_id and str(mid) != meeting_id:
             continue
         if not meeting_id and m.get("status") != "complete":
             continue
@@ -48,18 +92,22 @@ def load_meeting(meeting_id=None, meetings_dir=None):
         raise RuntimeError("no matching complete meeting found")
     candidates.sort()
     _, d, m = candidates[-1]
-    mid = m.get("id") or os.path.basename(d)
-    wav = os.path.join(d, "microphone.wav")
-    if not os.path.isfile(wav):
-        wav = os.path.join(d, "system.wav")
-    export_path = m.get("export_path")
-    transcript_md = export_path if (export_path and os.path.isfile(export_path)) else os.path.join(d, "transcript.md")
-    if not os.path.isfile(transcript_md):
+    mid = str(m.get("id") or os.path.basename(d))
+    if not _validate_meeting_id(mid):
+        raise RuntimeError("invalid meeting id")
+
+    transcript_md = _resolve_transcript_path(m.get("export_path"), d, meetings_dir)
+    if not transcript_md:
         raise RuntimeError("transcript not found")
     with open(transcript_md, "r", encoding="utf-8") as f:
         transcript = f.read()
+
+    wav = os.path.join(d, "microphone.wav")
     if not os.path.isfile(wav):
+        wav = os.path.join(d, "system.wav")
+    if not os.path.isfile(wav) or not _is_inside(wav, meetings_dir):
         raise RuntimeError("audio file not found")
+
     return {"id": mid, "dir": d, "manifest": m, "wav": wav, "transcript_path": transcript_md, "transcript": transcript}
 
 
@@ -235,7 +283,7 @@ def main():
         summary_text = "## 语音笔记整理\n### 摘要\n" + (meeting.get("transcript") or "")[:400]
 
     if args.page_id:
-        page_id = args.page_id
+        page_id = _validate_uuid(args.page_id, "page-id")
         page_url = f"https://flowus.cn/{page_id}"
         print("PAGE_TARGET", page_id, page_url)
     else:
@@ -243,10 +291,12 @@ def main():
             raise SystemExit("error: provide --page-id, or --parent-page-id, or --database-id")
         icon = {"type": "emoji", "emoji": "🎙️"}
         if args.parent_page_id:
-            page_body = {"parent": {"type": "page_id", "page_id": args.parent_page_id},
+            parent_page_id = _validate_uuid(args.parent_page_id, "parent-page-id")
+            page_body = {"parent": {"type": "page_id", "page_id": parent_page_id},
                          "title": [{"type": "text", "text": {"content": title}}], "icon": icon}
         else:
-            page_body = {"parent": {"type": "database_id", "database_id": args.database_id},
+            database_id = _validate_uuid(args.database_id, "database-id")
+            page_body = {"parent": {"type": "database_id", "database_id": database_id},
                          "title": [{"type": "text", "text": {"content": title}}], "icon": icon}
         tmp = os.path.join(tempfile.gettempdir(), "vn_page.json")
         with open(tmp, "w", encoding="utf-8") as f:
