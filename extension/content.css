@@ -72,7 +72,9 @@
   position: absolute;
   right: 0;
   bottom: calc(100% + 6px);
-  max-width: 260px;
+  width: max-content;
+  max-width: 280px;
+  min-width: 72px;
   padding: 4px 8px;
   font-size: 11px;
   line-height: 1.4;
@@ -81,8 +83,11 @@
   border: 1px solid var(--fvn-border);
   border-radius: 6px;
   box-shadow: var(--fvn-shadow);
-  white-space: pre-wrap;
+  white-space: normal;
   word-break: break-word;
+  overflow-wrap: anywhere;
+  writing-mode: horizontal-tb;
+  text-align: left;
   pointer-events: none;
   opacity: 0;
   transform: translateY(2px);
