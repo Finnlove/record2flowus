@@ -175,6 +175,11 @@ Useful options: `--meeting-id`, `--meetings-dir`, `--summary-file`, `--mindmap-j
 - **M3:** stability, recovery, idempotency, data/temp management, tests.
 - **M4:** UX polish and release packaging.
 
+## Contributors
+
+- **[Finnlove](https://github.com/Finnlove)** — author
+- **[OpenCode](https://opencode.ai/)** — contributor
+
 ## License
 
 MIT (see [LICENSE](LICENSE)).
