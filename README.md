@@ -153,6 +153,14 @@ Useful options: `--meeting-id`, `--meetings-dir`, `--summary-file`, `--mindmap-j
 └─ README.md
 ```
 
+## Development
+
+Run text-processing regression tests (stdlib `unittest`, no third-party deps, no real tokens/IDs/audio):
+
+```powershell
+python -m unittest discover -s tests -p "test_*.py" -v
+```
+
 ## Limitations
 
 - Baseline summarization/mind-map generation is heuristic (pluggable).
