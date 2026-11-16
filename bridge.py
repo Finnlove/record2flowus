@@ -1,3 +1,4 @@
+import hashlib
 import hmac
 import json
 import os
@@ -683,8 +684,15 @@ def detect_new_meeting(before_ids, timeout_s=20):
 
 
 def _job_dir(archive_id):
-    safe = re.sub(r"[^A-Za-z0-9._:-]+", "_", str(archive_id or "job"))[:180]
-    d = os.path.join(ARCHIVE_ARTIFACTS_DIR, safe)
+    # Windows 禁止在目录名中使用 ':'（archive_id 形如 vnarc::append::<mid>::<page>），
+    # 旧白名单 [A-Za-z0-9._:-] 放行了 ':'，导致 os.makedirs 抛
+    # [WinError 123] 且每次归档立即失败。这里只保留跨平台安全字符。
+    raw = str(archive_id or "job")
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+    safe = re.sub(r"\.{2,}", ".", safe).strip("._-")[:120] or "job"
+    # 清洗可能让不同 archive_id 落到同名目录；尾缀短哈希保证一一对应
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+    d = os.path.join(ARCHIVE_ARTIFACTS_DIR, safe + "-" + digest)
     os.makedirs(d, exist_ok=True)
     return d
 

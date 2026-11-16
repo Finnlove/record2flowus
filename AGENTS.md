@@ -145,6 +145,39 @@ elif origin:
 
 **通用结论**：本地回环桥接服务面向浏览器扩展时，**不要要求请求带 Origin**；用 token 承担身份校验，Origin 仅作“若存在则必须匹配”的附加校验。
 
+### 7.2 真实案例：archive_id 含 `::` 导致 Windows 建目录失败（已修复）
+
+**现象**：真实录音停止后归档 100% 失败，扩展/桥接状态落到 `error`，页面上什么都没写入。ledger 唯一线索：
+
+```
+[WinError 123] 文件名、目录名或卷标语法不正确。:
+'...\hex-flowus-voice-note\artifacts\vnarc::append::1794797556810-1424::e2f5c558-...'
+```
+
+**根因**：`archive_id` 由 `make_archive_id()` 生成为 `vnarc::<mode>::<meeting>::<page>`，而 `bridge.py` 的 `_job_dir()` 用
+`re.sub(r"[^A-Za-z0-9._:-]+", "_", ...)` 清洗 —— 白名单里有 `:`，**Windows 目录名不允许冒号**，因此每次归档在 `os.makedirs()` 第一步就崩。
+讽刺的是同一文件 `process_and_upload()` 里另一处 `run_tag` 已经写了 `.replace(":", "_")`，说明作者知道冒号不能用，但 `_job_dir()` 漏了。
+
+**修复**（`_job_dir()`）：白名单去掉 `:`，折叠连续点，文件名限长，并追加 `sha1(archive_id)[:10]` 后缀防清洗后重名：
+
+```python
+raw = str(archive_id or "job")
+safe = re.sub(r"[^A-Za-z0-9._-]+", "_", raw)
+safe = re.sub(r"\.{2,}", ".", safe).strip("._-")[:120] or "job"
+digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+d = os.path.join(ARCHIVE_ARTIFACTS_DIR, safe + "-" + digest)
+```
+
+**回归测试**：`tests/test_job_dir.py`（7 用例，纯标准库）—— 真实 archive_id 能建目录、目录名无 Windows 非法字符、清洗后同名仍不共用目录、`..` 被中和、名字限长。
+
+**排查法则**：
+
+1. **单元测试全绿 ≠ 真实流程可用**。此前 38 个测试全 PASS，但没有一个用例真的在 Windows 上建 `_job_dir()`。凡是“用 ID 拼文件系统路径”的地方，都要有一条真建目录的用例。
+2. **失败先看 ledger，别猜**。`APPDATA%\hex-flowus-voice-note\archive_ledger.sqlite3` 的 `archives` 表（`status` / `error` / `steps_json`）与 `artifacts\<job>\runs\<tag>\*.json` 是唯一权威记录；`steps_json` 为 `{}` 说明在 `prepare` 阶段之前就崩了。
+3. **跨平台文件名统一用最小白名单** `[A-Za-z0-9._-]`，不要包含 `:` `*` `?` `"` `<` `>` `|` `/` `\`。`archive_id` 这类内部 ID 可以含分隔符，落盘前必须转换。
+4. 清洗会丢信息 → 必须补哈希后缀，否则不同 `archive_id` 可能共用同一 job 目录，造成产物串用。
+
+
 
 ---
 
