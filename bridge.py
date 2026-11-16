@@ -1207,7 +1207,10 @@ class Handler(BaseHTTPRequestHandler):
             return False
         origin = self.headers.get("Origin")
         if ALLOWED_ORIGIN:
-            if not origin or origin != ALLOWED_ORIGIN:
+            # Chrome 157 extension service-worker fetches carry NO Origin header.
+            # A request without Origin is not a web page origin; the Bearer token
+            # remains mandatory, so allow it. Only a mismatching Origin is rejected.
+            if origin and origin != ALLOWED_ORIGIN:
                 self._reject(403, "forbidden origin")
                 return False
         elif origin:

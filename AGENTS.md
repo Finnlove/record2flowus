@@ -95,7 +95,7 @@
 
 1. **环境检查通过**：`doctor.cmd` 关键项 PASS（或已知 WARN 经用户确认可接受）；Python/Hex/FlowUs CLI/配置/扩展文件满足当前阶段要求。
 2. **Bridge 启动成功**：`python bridge.py --check` 通过对应启动前提且 `python bridge.py`/`start.cmd` 成功监听 `http://127.0.0.1:<port>`（无配置/端口占用等启动错误）；可选用认证后的 `/ping`（或扩展测试连接）辅助确认可达性。
-3. **浏览器扩展连接成功**：扩展 Options 中 token/端口正确且“测试连接”成功（或等价认证请求成功）；`bridge_allowed_origin` 与实际扩展一致且桥接已重启。
+3. **浏览器扩展连接成功**：扩展 Options 中 token/端口正确且“测试连接”成功（或等价认证请求成功）。注意（Chrome 157+）：扩展 service worker 的 `fetch()` **不携带 `Origin`**，桥接对“无 Origin”放行、身份由 Bearer token 强制；因此连接成功**不再依赖** `bridge_allowed_origin` 匹配，该配置仅在“请求带 Origin 且不匹配”时触发 403（详见 [7.1](#71-真实案例chrome-扩展请求不带-origin已修复)）。
 4. **录音和转写成功**：在用户授权的 FlowUs 页面触发录音/停止后，Hex 生成有效会议产物（音频、转写、manifest/完成状态等）；桥接状态推进至处理阶段且无 Hex/转写错误（以桥接日志/状态与本地产物为准）。
 5. **FlowUs 页面归档成功**：目标页面**实际追加/生成**预期内容（概览/摘要/要点/待办、折叠转写、音频/文件块、可选思维导图等，以当次运行配置为准），且**由用户确认内容正确**。CLI 场景以命令成功输出与用户核验页面为准。
 
@@ -108,6 +108,43 @@
 - **优先工具/入口**：`doctor.cmd`（`python scripts/doctor.py`）、`python bridge.py --check`、`start.cmd` 预检输出、扩展 Options 的“测试连接”、桥接控制台日志（UI 状态为脱敏提示）。
 - **依据实际错误分类处理**（详见 [`docs/troubleshooting.md`](docs/troubleshooting.md)）：Python/配置解析失败、token 缺失或不匹配、Origin 被拒绝/未配置、端口占用或桥接不可达、扩展未加载/页面 ID 未识别、Hex 未就绪或会议未启用、FlowUs CLI 未认证/无权限/上传追加失败、重复追加（无幂等）等。
 - **原则**：先定位根因（配置对齐、进程/端口、鉴权、外部依赖状态），再做最小修复并逐层复验；不要在失败原因不明时盲目重复执行录制、停止或同步命令。
+
+### 7.1 真实案例：Chrome 扩展请求不带 Origin（已修复）
+
+**现象**：扩展 Options「测试连接」始终报 `❌ Origin 被拒绝（扩展 ID 与桥接配置不匹配）`，但实际扩展 ID 与 `bridge_allowed_origin` 完全一致；而用 `curl` / `Invoke-WebRequest` 手动带该 Origin 请求却返回 200。
+
+**根因**：
+- Chrome 157 起，扩展 service worker 发起的 `fetch("http://127.0.0.1:<port>/...")` **不携带 `Origin` 请求头**（`Origin` 属浏览器禁用头，扩展代码无法自行添加），通常也不发 CORS 预检。
+- 旧版 `_preflight()` 判定为 `if not origin or origin != ALLOWED_ORIGIN: 403`，把“无 Origin”当成可疑来源，因此**真实扩展请求必然被拒**。
+- 手动验证时人为补上了 `Origin`，测到的是“构造出来的请求”，不是扩展的真实请求，所以永远复现不出该问题。
+
+**修复**（`bridge.py` → `_preflight()`）：
+
+```python
+origin = self.headers.get("Origin")
+if ALLOWED_ORIGIN:
+    # Chrome 157 extension service-worker fetches carry NO Origin header.
+    # A request without Origin is not a web page origin; the Bearer token
+    # remains mandatory, so allow it. Only a mismatching Origin is rejected.
+    if origin and origin != ALLOWED_ORIGIN:
+        self._reject(403, "forbidden origin")
+        return False
+elif origin:
+    self._reject(403, "origin not allowed")
+    return False
+```
+
+即 **有 Origin 必须匹配、无 Origin 放行**；身份仍由 `Authorization: Bearer <bridge_token>` 强制校验。
+
+**排查法则（重要，勿重蹈覆辙）**：
+
+1. **先抓真实请求头，再改代码**。在 `_preflight()` 开头临时落盘 `method/path/Host/Origin/UA`，让用户点一次「测试连接」，看日志里到底有没有 `Origin`。不要用自己构造的请求去“复现”——构造请求会补上客户端根本不会发的头。
+2. **不要相信错误文案给出的归因**。扩展把任意 403 都映射成“Origin 被拒绝（扩展 ID 与配置不匹配）”，这句话把排查带偏两轮（核对扩展 ID、重启进程），而 ID 自始至终是对的。
+3. **区分“预检通过”与“真机通过”**。手写 `OPTIONS` 预检返回 204 毫无意义，因为扩展可能根本不发预检。
+4. 排查结束后**移除临时日志代码并重启**，删除 `bridge_debug.log`，避免残留调试逻辑。
+
+**通用结论**：本地回环桥接服务面向浏览器扩展时，**不要要求请求带 Origin**；用 token 承担身份校验，Origin 仅作“若存在则必须匹配”的附加校验。
+
 
 ---
 
@@ -124,7 +161,7 @@ Agent **不得擅自**：
 
 **必须先获得用户明确授权**的操作（并说明范围与风险）包括但不限于：向真实 FlowUs 页面/数据库写入或创建内容（含首次归档验证）、删除/覆盖任何本地或远端数据、修改或重新生成 `bridge_token`/鉴权信息、变更端口/Origin/权限相关配置、安装或更新系统/外部依赖、执行可能产生费用或影响他人协作空间的操作。
 
-> 附加安全事实（实现已强制）：桥接仅本地回环、要求 token 与请求校验、对 Origin/Host/输入/路径做限制、`/state` 脱敏；但**工具与配置错误仍可能导致数据写入或泄露**，Agent 必须遵循最小授权与可验证原则。
+> 附加安全事实（实现已强制）：桥接仅本地回环、要求 token 与请求校验、对 Host/输入/路径做限制、`/state` 脱敏；**Origin 采用“有则必须匹配、无则放行”策略**（Chrome 扩展请求不含 Origin，身份由 Bearer token 强制承担）；但**工具与配置错误仍可能导致数据写入或泄露**，Agent 必须遵循最小授权与可验证原则。
 
 ---
 
