@@ -234,25 +234,57 @@ def extract_transcript_text(transcript_md):
     return text
 
 
+# Sentence-final shapes that are only grammatical when the next clause follows.
+# ASR cuts at a pause and then inserts a period, so these survive as "sentences":
+#   "他会进行他的一个。" / "我会发回给这个。" / "让这个智能体直接去。"
+_HANGING_TAIL_RE = re.compile(
+    r"(?:(?:的|地|了)(?:一|这|那|哪|几)(?:个|种|件|些|步|块|条|项)"
+    r"|(?:一|这|那|哪|几)(?:个|种|件|些)"
+    r"|(?:直接|就|再|马上)(?:去|来|走))$"
+)
+
+
 def _looks_truncated(s):
     raw = str(s or "").strip()
     t = _clean_spoken(s)
     plain = re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)
     if not t:
         return True
+    # Sentence-final punctuation blinds every $-anchored rule below: ASR emits
+    # "他会进行他的一个。" with a period, but the thought is still open.
+    core = t.rstrip("。！？!?；;，,、 \t")
+    plain_core = re.sub(r"[\s\W_]+", "", core, flags=re.UNICODE)
+    if _HANGING_TAIL_RE.search(core):
+        return True
     # explicit ASR-break / incomplete-thought patterns
-    if re.search(r"(?:很多情况下|诸如此类的东西)$", t):
+    if re.search(r"(?:很多情况下|诸如此类的东西)$", core):
         return True
-    if re.search(r"(?:整理|描|描述)$", t) and len(plain) <= 60:
+    if re.search(r"(?:整理|描|描述)$", core) and len(plain) <= 60:
         return True
-    if re.search(r"(?:表现|输入|输出)$", t) and len(plain) <= 60:
+    if re.search(r"(?:表现|输入|输出)$", core) and len(plain) <= 60:
         return True
-    if re.search(r"(?:的|地|得|在|把|被|给|和|与|及|或|对|向|从|到|要|想|去|做|用|来)$", t) and len(plain) < 30:
+    if re.search(r"(?:的|地|得|在|把|被|给|和|与|及|或|对|向|从|到|要|想|去|做|用|来)$", core) and len(plain_core) < 30:
         return True
     # very short fragment with no clear sentence completeness (but allow normal punctuated sentences)
     if len(plain) < 6 and not re.search(r"[。！？!?；;]$", raw):
         return True
     return False
+
+
+def _join_fragments(buf, nxt):
+    """Join an ASR-cut fragment with the clause that actually continues it."""
+    prev = buf.rstrip("。！？!?；;，,、 \t")
+    nxt = (nxt or "").strip()
+    if not prev:
+        return nxt
+    # "...我会发回给这个" + "GPT，让他..." → drop the orphaned determiner
+    if re.match(r"^[A-Za-z0-9]", nxt) and re.search(r"(?:这个|那个|这些|那些)$", prev):
+        return re.sub(r"(?:这个|那个|这些|那些)$", "", prev) + nxt
+    # "他会进行他的一个" + "提高我们的工作效率" → the measure word already binds them;
+    # inserting a comma here would manufacture an unnatural pause
+    if re.search(r"(?:的|地|了)?(?:一|这|那)(?:个|种|件|些)$", prev):
+        return prev + nxt
+    return prev + "，" + nxt
 
 
 def _split_sentences(text):
@@ -270,7 +302,7 @@ def _split_sentences(text):
     merged = []
     buf = ""
     for s in raw:
-        cand = (buf + " " + s).strip() if buf else s
+        cand = _join_fragments(buf, s) if buf else s
         if _looks_truncated(cand):
             buf = cand
             # avoid runaway merge
@@ -304,6 +336,8 @@ def _clean_spoken(s):
     # inline fillers in Chinese speech
     t = re.sub(r"(?:\s+|[，,])(?:嗯+|啊+|呃+|哦+|唉+|哈+|呀)(?:\s+|[，,])", "，", t)
     t = re.sub(r"(?:嗯+|呃+|哦+|唉+)\s*", "", t)
+    # hesitation "，就是，" survives mid-sentence and reads as a broken cut
+    t = re.sub(r"[，,]\s*(?:就是|然后|那么)[，,]\s*", "，", t)
     t = re.sub(r"(?<=[\u4e00-\u9fff，,\s])(哈|呢)(?=[，,\s。！？!?])", "", t)
     t = re.sub(r"([，,])\s*([，,])+", "，", t)
     for p in _FILLER_PHRASES:
@@ -340,6 +374,10 @@ def _is_complete_enough(s):
     t = _clean_spoken(s).strip()
     plain = re.sub(r"[\s\W_]+", "", t, flags=re.UNICODE)
     if len(plain) < 8:
+        return False
+    # A sentence still ending in a hanging structure is a fragment, never a standalone point,
+    # however long it is ("完了之后记录之后呢，他会进行他的一个。").
+    if _looks_truncated(s):
         return False
     # reject common broken starts from ASR chunking / clause fragments
     if re.match(r"^(?:的|了|着|过|得|把|被|是说明|是因为|学\s*school|school\b|等他|再一个|说孩子|咱们现在这个页面)", t):
@@ -378,23 +416,28 @@ def _format_point(s, limit=88):
     if len(t) > limit:
         window = t[:limit]
         cut = -1
+        cut_sep = ""
         for sep in ["。", "！", "？", "；"]:
             idx = window.rfind(sep)
             if idx >= max(18, limit - 30):
                 cut = idx
+                cut_sep = sep
                 break
         if cut <= 0:
             for sep in ["，", ",", " "]:
                 idx = window.rfind(sep)
                 if idx >= max(24, limit - 24):
                     cut = idx
+                    cut_sep = sep
                     break
         if cut > 0:
             t = window[:cut].rstrip(" \t\r\n-•·，,；;：:")
         else:
             t = window.rstrip(" \t\r\n-•·，,；;：:")
         if t and not t.endswith(("。", "！", "？", "…")):
-            t += "。"
+            # only claim a full stop when we actually cut on sentence punctuation;
+            # a clause-level cut must stay visibly open instead of faking completeness
+            t += "。" if cut_sep in ("。", "！", "？", "；") else "…"
     else:
         # ensure it reads like a complete point
         if not t.endswith(("。", "！", "？")):
@@ -511,6 +554,15 @@ def _pick_points(text, limit=5):
     return points
 
 
+# Explicit next-step / hand-off intent. Spoken Chinese states todos without keywords:
+#   "等一下…我会发回给 GPT，让他跟我继续进行这个项目的审计"
+_NEXT_STEP_RE = re.compile(
+    r"(?:等一下|接下来|下一步|回头|稍后|后面|结束后)[^。]{0,12}?(?:我会|我们要|我需要|就|再|要|需要|把)"
+    r"|(?:让|请|叫)(?:他|她|它|你|我|大家)[^。]{0,10}?(?:去|来|继续|帮|做|处理|跟进|看)"
+    r"|(?:继续|接着)(?:进行|做|跟进|观察|审计)"
+)
+
+
 def _extract_action_items(text):
     if not text:
         return []
@@ -524,22 +576,32 @@ def _extract_action_items(text):
     for s in _split_sentences(text):
         has_strong = any(k in s for k in strong_cues)
         has_weak = any(k in s for k in weak_cues)
-        if not (has_strong or has_weak):
+        # Spoken next-step intent often carries no keyword at all:
+        # "等一下…我会发回给这个 GPT，让他跟我继续进行这个项目的审计"
+        m_next = _NEXT_STEP_RE.search(s)
+        if not (has_strong or has_weak or m_next):
             continue
         # weak cues are easy to false-positive in discussion; require action-oriented phrasing
         if not has_strong:
-            if not re.search(r"(需要|请|记得|务必|尽快|负责).{0,8}(做|改|修|补|发|提|联|确|处|查|写|测|安|跟)", s):
+            if not (m_next or re.search(r"(需要|请|记得|务必|尽快|负责).{0,8}(做|改|修|补|发|提|联|确|处|查|写|测|安|跟)", s)):
                 continue
         # avoid meta/system phrases and pure narration
         if "幂等" in s and "meeting id" in s.lower():
             continue
         if re.search(r"(已经|已|刚刚|之前).{0,6}(完成|处理|修复|确认)", s):
             continue
-        item = s.strip(" 。！？!?；;")
+        body = s.strip()
+        if m_next and m_next.start() > 0:
+            # drop the narration lead-in so the item starts at the actionable part
+            body = body[m_next.start():]
+        item = body.strip(" 。！？!?；;")
         if len(item) < 6:
             continue
         if len(item) > 60:
-            item = item[:58].rstrip() + "…"
+            # cut at a clause boundary, never mid-clause: a clipped half-sentence is unreadable
+            cuts = [item.rfind(c, 0, 60) for c in "，,；;。"]
+            cut = max(cuts)
+            item = (item[:cut] if cut >= 24 else item[:58]).rstrip("，,；;。 ") + "…"
         key = re.sub(r"\s+", "", item)
         if not key or key in seen:
             continue
