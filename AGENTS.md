@@ -82,6 +82,8 @@
 | `hex_meetings_dir` | Hex 会议产物目录（可选） | 为空时通常回退默认 `%APPDATA%\hex\meetings`（以实现为准）。 |
 | `hex_export_dir` | Hex 导出目录（可选） | 用于转写路径解析的允许目录之一（以实现为准）。 |
 | `sync_script` | 桥接调用的同步脚本路径 | 默认 `scripts/sync_to_flowus.py`（仓库布局）；相对路径相对仓库/桥接目录解析（以 `bridge.py` 为准）。 |
+| `autostart` | 桥接启动后是否写入开机自启 | 默认 `true`；开启时在 `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup` 写入/刷新 `record2flowus-bridge.vbs`（指向 `pythonw bridge.py`，绝对路径）。`false` 或环境变量 `BRIDGE_AUTOSTART=0` 可关闭；`--check` 会报告当前状态。 |
+| `summary_mode` | 摘要生成方式 | `rules`（默认，启发式挑句+清洗，**不改写句子**）或 `ollama`（本地 LLM 改写，失败自动回退 rules 并标记 `fallback`）。改此字段后若要让已归档会议再生效，需 `/retry` 带 `"regenerate": true`。 |
 
 - **区分与禁止**：
   - **允许（本地产品行为）**：本地安装/配置程序（如 `scripts/setup.py`）在用户本机终端向用户展示新生成的 `bridge_token`，供用户复制到扩展选项与本地配置。
@@ -94,7 +96,7 @@
 必须明确区分以下层级，**不得将任一项成功冒充为整个流程成功**：
 
 1. **环境检查通过**：`doctor.cmd` 关键项 PASS（或已知 WARN 经用户确认可接受）；Python/Hex/FlowUs CLI/配置/扩展文件满足当前阶段要求。
-2. **Bridge 启动成功**：`python bridge.py --check` 通过对应启动前提且 `python bridge.py`/`start.cmd` 成功监听 `http://127.0.0.1:<port>`（无配置/端口占用等启动错误）；可选用认证后的 `/ping`（或扩展测试连接）辅助确认可达性。
+2. **Bridge 启动成功**：`python bridge.py --check` 通过对应启动前提且 `python bridge.py`/`start.cmd` 成功监听 `http://127.0.0.1:<port>`（无配置/端口占用等启动错误）；可选用认证后的 `/ping`（或扩展测试连接）辅助确认可达性。启动成功后默认写入/刷新开机自启（`autostart`, 默认 `true`，见 §5）。
 3. **浏览器扩展连接成功**：扩展 Options 中 token/端口正确且“测试连接”成功（或等价认证请求成功）。注意（Chrome 157+）：扩展 service worker 的 `fetch()` **不携带 `Origin`**，桥接对“无 Origin”放行、身份由 Bearer token 强制；因此连接成功**不再依赖** `bridge_allowed_origin` 匹配，该配置仅在“请求带 Origin 且不匹配”时触发 403（详见 [7.1](#71-真实案例chrome-扩展请求不带-origin已修复)）。
 4. **录音和转写成功**：在用户授权的 FlowUs 页面触发录音/停止后，Hex 生成有效会议产物（音频、转写、manifest/完成状态等）；桥接状态推进至处理阶段且无 Hex/转写错误（以桥接日志/状态与本地产物为准）。
 5. **FlowUs 页面归档成功**：目标页面**实际追加/生成**预期内容（概览/摘要/要点/待办、折叠转写、音频/文件块、可选思维导图等，以当次运行配置为准），且**由用户确认内容正确**。CLI 场景以命令成功输出与用户核验页面为准。
@@ -211,6 +213,29 @@ d = os.path.join(ARCHIVE_ARTIFACTS_DIR, safe + "-" + digest)
 3. **ASR 的句号不代表句子结束**。判断"是否成句"只能看语法收尾（悬空量词／悬空动词），不能看标点。
 4. **要点残缺会连带毁掉下游**：待办识别、思维导图节点都建立在同一批句子上，断句一错，整条链路一起废。
 5. **规则模式的能力上界**：`summary_mode=rules` 只是"挑句子 + 清洗"，不会改写、不会补主语，因此永远无法把口语残句变成通顺书面句。要真正"成句"，需 `summary_mode=ollama`（本机需先起 Ollama，如 `qwen2.5:7b`）；否则应在文档中明确"要点为转写原句摘录"。
+
+### 7.4 真实案例：改了摘要逻辑却"页面没变"——artifact 缓存（已修复）
+
+**现象**：修好 7.3 的断句逻辑、重启桥接、重新归档同一场会议，FlowUs 页面**仍是旧文案**（残句要点、可行动项为空），看起来像修复没生效。
+
+**根因**：`_prepare_job_artifacts()` 只要 `summary.md` / `mindmap.json` / `job.json` 存在且 meeting/archive 匹配，就**直接复用缓存**，不重新生成摘要；而 `process_and_upload()` 硬编码 `force_regen=False`。即"重跑归档"= "重传旧产物"。
+
+**修复**：`POST /retry` 支持 `"regenerate": true`（`/retry` → `worker_retry_archive(regenerate=...)` → `process_and_upload(regenerate=...)` → `_prepare_job_artifacts(force_regen=True)`）；开启时**不复用** mindmap id，但**仍复用**已上传音频（`reuse_upload_oss_name`），避免重复上传数 MB 文件。
+
+**刷新页面的正确姿势（重要）**：
+
+1. `flowus block children <page_id> --page-size 100`（注意分页 `has_more`/`next_cursor`）拿到全部顶层块 id；
+2. 逐块 `flowus --json block update <block_id> --body {"archived":true}` 移入回收站（CLI **没有 delete** 子命令）；归档追加模式不会自己清理旧内容；
+3. ledger 里把该 archive 行的 `status` 改回 `error`（**不要 `DELETE` 行**——`worker_retry_archive` 要求记录存在，且 `done` 状态会被 `claim` 拒绝）；
+4. `POST /retry` body `{"archive_id": "...", "regenerate": true}`；
+5. 用 `flowus --json markdown get <page_id>` 核验要点/待办是否真变。
+
+**排查法则**：
+
+1. **"代码改了但输出没变"第一嫌疑是缓存**，先确认是否存在 artifact 复用分支，再怀疑修复本身。
+2. **重跑 ≠ 重算**。凡是带产物缓存的重试机制，必须提供显式"重新生成"开关，并在文档里写清默认行为。
+3. **ledger 的 `status` 是状态机，不是可随意删的行**；删行会让重试直接报 `archive record not found`。
+4. 刷新线上页面要**先清旧块再写**，否则幂等 marker 与追加写入会让你看到"新旧混排"。
 
 ---
 

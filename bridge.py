@@ -857,10 +857,10 @@ def _ledger_retry_context(archive_id):
         return {}
 
 
-def process_and_upload(meeting_id, page_id, archive_id=None, page_url=None, page_title=None, retry=False):
+def process_and_upload(meeting_id, page_id, archive_id=None, page_url=None, page_title=None, retry=False, regenerate=False):
     if archive_id:
         meeting, job_dir, sum_path, mm_path, job_meta = _prepare_job_artifacts(
-            meeting_id, archive_id, page_id, page_url=page_url, page_title=page_title, force_regen=False
+            meeting_id, archive_id, page_id, page_url=page_url, page_title=page_title, force_regen=bool(regenerate)
         )
     else:
         meeting = load_meeting_artifacts(meeting_id)
@@ -894,7 +894,7 @@ def process_and_upload(meeting_id, page_id, archive_id=None, page_url=None, page
         rctx = _ledger_retry_context(archive_id)
         if rctx.get("reuse_upload_oss_name"):
             cmd += ["--reuse-upload-oss-name", str(rctx["reuse_upload_oss_name"]), "--reuse-upload-size", str(int(rctx.get("reuse_upload_size") or 0))]
-        if rctx.get("reuse_mindmap_id") or rctx.get("reuse_mindmap_url"):
+        if (not regenerate) and (rctx.get("reuse_mindmap_id") or rctx.get("reuse_mindmap_url")):
             if rctx.get("reuse_mindmap_id"):
                 cmd += ["--reuse-mindmap-id", str(rctx["reuse_mindmap_id"])]
             if rctx.get("reuse_mindmap_url"):
@@ -1071,7 +1071,7 @@ def worker_stop_and_process():
                 state.update({"status": "error", "error": str(e), "message": "processing failed", "archive_id": archive_id})
 
 
-def worker_retry_archive(archive_id=None, meeting_id=None, page_id=None):
+def worker_retry_archive(archive_id=None, meeting_id=None, page_id=None, regenerate=False):
     try:
         with lock:
             state.update({"status": "processing", "message": "retrying archive", "error": None, "result": None})
@@ -1119,7 +1119,7 @@ def worker_retry_archive(archive_id=None, meeting_id=None, page_id=None):
         with lock:
             state.update({"meeting_id": meeting_id, "page_id": page_id, "archive_id": archive_id, "message": "uploading to FlowUs (retry)"})
 
-        result = process_and_upload(meeting_id, page_id, archive_id=archive_id, page_url=page_url, page_title=page_title, retry=True)
+        result = process_and_upload(meeting_id, page_id, archive_id=archive_id, page_url=page_url, page_title=page_title, retry=True, regenerate=bool(regenerate))
         with lock:
             state.update({"status": "done", "message": "uploaded", "result": result})
         LEDGER.mark_done(archive_id, result=result)
@@ -1367,6 +1367,8 @@ class Handler(BaseHTTPRequestHandler):
             archive_id = payload.get("archive_id") or payload.get("archiveId") or state.get("archive_id")
             meeting_id = payload.get("meeting_id") or payload.get("meetingId") or state.get("meeting_id")
             page_id = payload.get("page_id") or payload.get("pageId") or state.get("page_id")
+            raw_regen = payload.get("regenerate")
+            regenerate = raw_regen is True or str(raw_regen).strip().lower() in ("1", "true", "yes", "on")
             # if nothing specified, pick latest retryable from ledger
             if not archive_id and not (meeting_id and page_id) and LEDGER:
                 try:
@@ -1378,8 +1380,8 @@ class Handler(BaseHTTPRequestHandler):
             if not archive_id and not (meeting_id and page_id):
                 self._send(400, {"ok": False, "error": "archive_id or (meeting_id,page_id) required (no retryable archive found)"})
                 return
-            threading.Thread(target=worker_retry_archive, args=(archive_id, meeting_id, page_id), daemon=True).start()
-            self._send(200, {"ok": True})
+            threading.Thread(target=worker_retry_archive, args=(archive_id, meeting_id, page_id, regenerate), daemon=True).start()
+            self._send(200, {"ok": True, "regenerate": regenerate})
 
         elif path == "/archives":
             if not LEDGER:
@@ -1423,6 +1425,71 @@ def _print_startup_help(msg, fix=None):
     print("Tip: run `python scripts/doctor.py` for diagnostics, or `python scripts/setup.py` to configure.", file=sys.stderr)
 
 
+# ---- autostart (keep the bridge running after login) ----
+
+AUTOSTART_NAME = "record2flowus-bridge.vbs"
+
+
+def _autostart_enabled():
+    raw = os.environ.get("BRIDGE_AUTOSTART")
+    if raw is None:
+        raw = CFG.get("autostart", True)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("0", "false", "no", "off", "disabled")
+
+
+def autostart_dir():
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+
+
+def autostart_path():
+    return os.path.join(autostart_dir(), AUTOSTART_NAME)
+
+
+def _autostart_vbs():
+    py = sys.executable or "python"
+    if py.lower().endswith("python.exe"):
+        candidate = py[: -len("python.exe")] + "pythonw.exe"
+        if os.path.isfile(candidate):
+            py = candidate
+    bridge_py = os.path.join(BASE_DIR, "bridge.py")
+    return (
+        "' Generated by bridge.py on start-up so the bridge is ready after login.\r\n"
+        "' Delete this file (or set \"autostart\": false) to disable.\r\n"
+        'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        f'WshShell.CurrentDirectory = "{BASE_DIR}"\r\n'
+        'WshShell.Run """' + py + '"" ""' + bridge_py + '""", 0, False\r\n'
+    )
+
+
+def ensure_autostart():
+    """Install/refresh the Start-up shortcut. Idempotent; never fatal.
+
+    Returns "present" | "installed" | "error" | None (disabled / not Windows).
+    """
+    if _autostart_enabled() is False or os.name != "nt":
+        return None
+    try:
+        path = autostart_path()
+        content = _autostart_vbs()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+                    if f.read() == content:
+                        return "present"
+            except Exception:
+                pass
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        return "installed"
+    except Exception as e:
+        sys.stderr.write("[bridge] autostart setup skipped: %r\n" % (e,))
+        return "error"
+
+
 if __name__ == "__main__":
     if "--check" in sys.argv:
         # lightweight config/startup checks without serving
@@ -1456,6 +1523,14 @@ if __name__ == "__main__":
                 print(f"[PASS] bridge.browser_connect: 浏览器扩展可连接的桥接侧前提已满足（Origin 已配置且格式有效）。请确保扩展选项中的 token/端口与配置一致。")
 
         print("[INFO] bridge.e2e: 端到端归档可用性请运行 `python scripts/doctor.py`（检查 Hex、FlowUs CLI 认证、扩展文件等）。")
+
+        if os.name == "nt":
+            if not _autostart_enabled():
+                print("[INFO] bridge.autostart: 已显式关闭（config autostart=false 或 BRIDGE_AUTOSTART=0）。")
+            elif os.path.isfile(autostart_path()):
+                print(f"[PASS] bridge.autostart: 开机自启已就绪（{autostart_path()}）。")
+            else:
+                print("[INFO] bridge.autostart: 尚未安装；成功启动一次 bridge.py 会自动创建开机自启项。")
 
         if not start_ok:
             print("Tip: run `python scripts/doctor.py` for diagnostics, or `python scripts/setup.py` to configure.", file=sys.stderr)
@@ -1500,6 +1575,16 @@ if __name__ == "__main__":
             sys.exit(2)
         _print_startup_help(f"failed to start server: {e}", "Check host/port permissions and configuration, then retry.")
         sys.exit(2)
+
+    # Server is actually serving: keep it ready after every login by default.
+    _autostart_state = ensure_autostart()
+    if _autostart_state == "installed":
+        print(f"[bridge] autostart installed: {autostart_path()}")
+    elif _autostart_state == "present":
+        print(f"[bridge] autostart already present: {autostart_path()}")
+    elif _autostart_state is None:
+        print("[bridge] autostart disabled (config autostart=false or BRIDGE_AUTOSTART=0)")
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

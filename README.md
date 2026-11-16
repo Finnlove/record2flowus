@@ -86,6 +86,7 @@ Key settings (`config.local.json`):
 - **`bridge_allowed_origin` (required for browser use):** must match the loaded extension origin; restart bridge after changes.
 - **`summary_mode` (optional):** `rules` (default, heuristic) or `ollama` (local LLM via Ollama). When `ollama` is selected, the bridge calls `ollama_url`/`ollama_model` and **falls back to rules on failure**.
 - **`archive_artifacts_dir` (optional):** persistent directory for generated summary/mindmap artifacts and retry context (default: `%APPDATA%/hex-flowus-voice-note/artifacts`).
+- **`autostart` (optional, default `true`):** on Windows, when the bridge starts serving it installs/refreshes a `record2flowus-bridge.vbs` launcher in the user Startup folder so the bridge comes back automatically after reboot. Set `false` (or env `BRIDGE_AUTOSTART=0`) to opt out; `--check` reports the current state.
 - Bridge binds to `127.0.0.1` only and validates Host/Origin, auth, and request inputs.
 - Config parse errors stop startup with explicit file/reason. Do **not** commit `config.json`/`config.local.json`.
 
@@ -132,7 +133,7 @@ Useful options: `--meeting-id`, `--meetings-dir`, `--summary-file`, `--mindmap-j
 
 - Failed/uncertain archives are recorded in a local SQLite ledger (`%APPDATA%/hex-flowus-voice-note/archive_ledger.sqlite3`) with step/status and preserved generated artifacts for retry.
 - **Extension:** when an archive fails and is retryable, the button shows a retry state — click to re-run the archive. If a write was uncertain, review the target page before retrying.
-- **Bridge API:** `POST /retry` (authenticated) retries the latest/current retryable archive (or a specified `archive_id`).
+- **Bridge API:** `POST /retry` (authenticated) retries the latest/current retryable archive (or a specified `archive_id`). Add `"regenerate": true` to the body to **regenerate the summary/mindmap from the transcript** instead of reusing cached artifacts (use this after changing `summary_mode` or summary logic); the uploaded audio is still reused.
 - **CLI:** `python scripts/retry_archive.py --list` / `python scripts/retry_archive.py [--archive-id ...]` (or `--call-bridge`).
 - Source Hex artifacts remain in the Hex meetings directory; generated summaries/mindmaps are kept in the archive artifacts directory until you choose to clean them.
 
