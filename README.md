@@ -77,14 +77,16 @@ Key settings (`config.local.json`):
   "bridge_allowed_origin": "chrome-extension://<EXTENSION_ID>",
   "summary_mode": "rules",
   "ollama_url": "http://127.0.0.1:11434",
-  "ollama_model": "qwen2.5:7b",
-  "ollama_timeout": 90,
+  "ollama_model": "qwen2.5:3b",
+  "ollama_timeout": 180,
   "archive_artifacts_dir": ""
 }
 ```
 - **`bridge_token` (required):** high-entropy random secret (>= 32 chars). Must match the extension Options value.
 - **`bridge_allowed_origin` (required for browser use):** must match the loaded extension origin; restart bridge after changes.
-- **`summary_mode` (optional):** `rules` (default, heuristic) or `ollama` (local LLM via Ollama). When `ollama` is selected, the bridge calls `ollama_url`/`ollama_model` and **falls back to rules on failure**.
+- **`summary_mode` (optional):** `rules` (default, heuristic) or `ollama` (local LLM via Ollama). When `ollama` is selected, the bridge calls `ollama_url`/`ollama_model` and **falls back to rules on failure**. Two things to know:
+  - **Model sizing:** `qwen2.5:3b` is the recommended default (~45 s per meeting on a 8 GB machine). `qwen2.5:7b` needs **≥16 GB RAM**; on 8 GB it swaps to pagefile and times out (measured 215 s → fallback).
+  - **Fallback is visible:** when the model is unavailable the generated page starts with a `⚠️ 本次摘要由规则模式生成` banner naming the reason, so a degraded archive is never mistaken for a code bug. The bridge also tries to start a local `ollama serve` when it starts serving (skipped when `summary_mode=rules`).
 - **`archive_artifacts_dir` (optional):** persistent directory for generated summary/mindmap artifacts and retry context (default: `%APPDATA%/hex-flowus-voice-note/artifacts`).
 - **`autostart` (optional, default `true`):** on Windows, when the bridge starts serving it installs/refreshes a `record2flowus-bridge.vbs` launcher in the user Startup folder so the bridge comes back automatically after reboot. Set `false` (or env `BRIDGE_AUTOSTART=0`) to opt out; `--check` reports the current state.
 - Bridge binds to `127.0.0.1` only and validates Host/Origin, auth, and request inputs.

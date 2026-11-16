@@ -38,12 +38,14 @@ def _build_ollama_prompt(meeting, transcript_text):
     dur_s = int((m.get("duration_ms") or 0) / 1000)
     mm, ss = divmod(dur_s, 60)
     return (
-        "你是语音笔记整理助手。请根据以下转写内容生成结构化中文整理结果。\n"
+        "你是语音笔记整理助手。输入是自动语音识别（ASR）的原始转写，可能含口语碎句、"
+        "重复词和错误断句。请据此生成结构化中文整理结果。\n"
         "要求：\n"
-        "1) 摘要：概括核心主题与结论，避免逐句照抄原话；不要编造未出现的信息。\n"
-        "2) 要点：3-6 条，每条是完整、可读的句子。\n"
+        "1) 摘要：概括核心主题与结论，用通顺书面语复述，不要逐句照抄原话；不要编造未出现的信息。\n"
+        "2) 要点：3-6 条，每条是完整、通顺、可独立阅读的句子（必须有主语和谓语），不要照搬口语碎片。\n"
         "3) 可行动项：仅在转写中有明确后续/待办意图时列出；没有则返回空数组。\n"
-        "4) 只输出 JSON，不要输出其他文字。JSON 格式：{\"summary\":\"...\",\"points\":[\"...\"],\"todos\":[\"...\"]}\n\n"
+        "4) 修复明显的 ASR 重复/断字（如把 \"G G GPT\" 规范为 \"GPT\"），但不要改变原意。\n"
+        "5) 只输出 JSON，不要输出其他文字。JSON 格式：{\"summary\":\"...\",\"points\":[\"...\"],\"todos\":[\"...\"]}\n\n"
         f"会议信息：id={mid}, title={title}, duration={mm:02d}:{ss:02d}\n"
         "转写：\n"
         f"{transcript_text}\n"
@@ -106,18 +108,38 @@ def _format_summary_md(meeting, summary, points, todos):
     return "\n".join(md)
 
 
+def _preflight_ollama(base, timeout=2.0):
+    """Fail fast when the local Ollama server is not reachable.
+
+    Without this, a down server costs the full `ollama_timeout` (minutes) before
+    falling back to rules, which looks like a hang.
+    """
+    try:
+        req = urllib.request.Request(base + "/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read(64)
+        return True
+    except Exception as e:
+        raise RuntimeError(
+            "ollama server not reachable at %s (%s); start it with `ollama serve` "
+            "or set summary_mode=rules" % (base, e)
+        )
+
+
 def summarize_with_ollama(meeting, transcript_text, cfg=None):
     cfg = cfg or {}
     base = str(cfg.get("ollama_url") or os.environ.get("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
-    model = str(cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL") or "qwen2.5:7b").strip()
-    timeout = int(cfg.get("ollama_timeout") or 90)
+    model = str(cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL") or "qwen2.5:3b").strip()
+    timeout = int(cfg.get("ollama_timeout") or 180)
+    _preflight_ollama(base)
     prompt = _build_ollama_prompt(meeting, _extract_transcript_for_prompt(transcript_text))
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0.2},
+        "keep_alive": "10m",
+        "options": {"temperature": 0.2, "num_predict": 900},
     }
     req = urllib.request.Request(
         base + "/api/generate",

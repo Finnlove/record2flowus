@@ -791,6 +791,8 @@ def _prepare_job_artifacts(meeting_id, archive_id, page_id, page_url=None, page_
     text = extract_transcript_text(meeting.get("transcript") or "")
     if generate_summary is not None:
         sres = generate_summary(meeting, text, cfg=SUMMARY_CFG, make_auto_summary_fn=make_auto_summary)
+        if sres.get("fallback"):
+            sys.stderr.write("[bridge] summary fallback to rules: %s\n" % (sres.get("fallback_reason") or "unknown"))
     else:
         summary_md, pts = make_auto_summary(meeting)
         sres = {"ok": True, "mode": "rules", "summary_md": summary_md, "points": pts or [], "fallback": False}
@@ -803,6 +805,14 @@ def _prepare_job_artifacts(meeting_id, archive_id, page_id, page_url=None, page_
         sres = {"ok": True, "mode": "rules", "summary_md": summary_md, "points": points or [], "fallback": True, "fallback_reason": "empty_summary"}
 
     mm_body = make_auto_mindmap(meeting, points)
+    if sres.get("fallback"):
+        # 用户只看 FlowUs 页面，看不到 stderr。降级必须在页面上可见，
+        # 否则"要点又是残句"会被当成 bug 而不是"模型没启动"。
+        summary_md = (
+            "> ⚠️ 本次摘要由**规则模式**生成（模型不可用：%s）\n"
+            "> 要点为转写原句的挑选与清洗，可能仍夹带口语碎片。"
+            "模型恢复后可用 `POST /retry` 带 `\"regenerate\": true` 重新生成。\n\n%s"
+        ) % (str(sres.get("fallback_reason") or "unknown")[:200], summary_md)
     with open(sum_path, "w", encoding="utf-8") as f:
         f.write(summary_md)
     with open(mm_path, "w", encoding="utf-8") as f:
@@ -1490,6 +1500,78 @@ def ensure_autostart():
         return "error"
 
 
+def _ollama_exe_candidates():
+    cands = []
+    cfg_exe = str(CFG.get("ollama_exe") or "").strip()
+    if cfg_exe:
+        cands.append(cfg_exe)
+    found = shutil.which("ollama")
+    if found:
+        cands.append(found)
+    local = os.environ.get("LOCALAPPDATA") or ""
+    if local:
+        cands.append(os.path.join(local, "Programs", "Ollama", "ollama.exe"))
+    cands.append(os.path.join(os.environ.get("ProgramFiles") or r"C:\Program Files", "Ollama", "ollama.exe"))
+    return cands
+
+
+def _summary_uses_ollama():
+    mode = str(SUMMARY_CFG.get("summary_mode") or "rules").strip().lower()
+    return mode in ("ollama", "llm", "model")
+
+
+def ensure_ollama(wait_sec=12.0):
+    """Make sure the local Ollama server is answering when summary_mode needs it.
+
+    Ollama is a separate process that can be closed (or die with a crashed shell);
+    when it is down the summary silently degrades to rules, which is exactly the
+    "要点还是残句" symptom users report. Start it detached if it is installed.
+
+    Returns "running" | "started" | "missing" | "failed" | None (not needed).
+    """
+    if not _summary_uses_ollama():
+        return None
+    try:
+        from scripts.summarizer import _preflight_ollama
+    except Exception:
+        return None
+    base = str(SUMMARY_CFG.get("ollama_url") or os.environ.get("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
+    try:
+        _preflight_ollama(base)
+        return "running"
+    except Exception:
+        pass
+    exe = next((p for p in _ollama_exe_candidates() if p and os.path.isfile(p)), None)
+    if not exe:
+        sys.stderr.write("[bridge] ollama not installed; summary will fall back to rules\n")
+        return "missing"
+    try:
+        flags = 0
+        if os.name == "nt":
+            flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW
+        subprocess.Popen(
+            [exe, "serve"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+    except Exception as e:
+        sys.stderr.write("[bridge] failed to start ollama: %r\n" % (e,))
+        return "failed"
+    deadline = time.time() + max(1.0, float(wait_sec))
+    while time.time() < deadline:
+        try:
+            _preflight_ollama(base)
+            sys.stderr.write("[bridge] started ollama serve (%s)\n" % exe)
+            return "started"
+        except Exception:
+            time.sleep(0.5)
+    sys.stderr.write("[bridge] ollama did not answer within %.0fs; summary will fall back to rules\n" % wait_sec)
+    return "failed"
+
+
 if __name__ == "__main__":
     if "--check" in sys.argv:
         # lightweight config/startup checks without serving
@@ -1523,6 +1605,21 @@ if __name__ == "__main__":
                 print(f"[PASS] bridge.browser_connect: 浏览器扩展可连接的桥接侧前提已满足（Origin 已配置且格式有效）。请确保扩展选项中的 token/端口与配置一致。")
 
         print("[INFO] bridge.e2e: 端到端归档可用性请运行 `python scripts/doctor.py`（检查 Hex、FlowUs CLI 认证、扩展文件等）。")
+
+        mode = str(SUMMARY_CFG.get("summary_mode") or "rules").strip().lower()
+        if mode in ("ollama", "llm", "model"):
+            model = str(SUMMARY_CFG.get("ollama_model") or os.environ.get("OLLAMA_MODEL") or "qwen2.5:3b")
+            url = str(SUMMARY_CFG.get("ollama_url") or os.environ.get("OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/")
+            try:
+                from scripts.summarizer import _preflight_ollama
+                _preflight_ollama(url)
+                print(f"[PASS] bridge.summary: summary_mode=ollama，Ollama 可达（{url}），模型 {model}。")
+            except Exception as e:
+                print(f"[FAIL] bridge.summary: summary_mode=ollama 但 Ollama 不可用：{e}", file=sys.stderr)
+                print("       fix: 运行 `ollama serve` 并 `ollama pull %s`；或把 summary_mode 改回 rules。" % model, file=sys.stderr)
+                print("       note: `python bridge.py` 正常启动时会尝试自动拉起本机 ollama serve；`--check` 不会启动任何进程。", file=sys.stderr)
+        else:
+            print("[INFO] bridge.summary: summary_mode=rules（启发式挑句+清洗，不改写句子；如需通顺书面语请切 ollama）。")
 
         if os.name == "nt":
             if not _autostart_enabled():
@@ -1584,6 +1681,16 @@ if __name__ == "__main__":
         print(f"[bridge] autostart already present: {autostart_path()}")
     elif _autostart_state is None:
         print("[bridge] autostart disabled (config autostart=false or BRIDGE_AUTOSTART=0)")
+
+    # summary_mode=ollama depends on a local Ollama server that is NOT part of
+    # this process; if it is down every archive silently degrades to rules.
+    _ollama_state = ensure_ollama()
+    if _ollama_state == "started":
+        print("[bridge] ollama serve started (was not running)")
+    elif _ollama_state == "missing":
+        print("[bridge] ollama not installed; summaries will fall back to rules")
+    elif _ollama_state == "failed":
+        print("[bridge] ollama unreachable; summaries will fall back to rules")
 
     try:
         server.serve_forever()

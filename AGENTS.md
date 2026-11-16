@@ -237,6 +237,26 @@ d = os.path.join(ARCHIVE_ARTIFACTS_DIR, safe + "-" + digest)
 3. **ledger 的 `status` 是状态机，不是可随意删的行**；删行会让重试直接报 `archive record not found`。
 4. 刷新线上页面要**先清旧块再写**，否则幂等 marker 与追加写入会让你看到"新旧混排"。
 
+### 7.5 真实案例：切到 ollama 后要点依旧是残句——Ollama 没在跑（已修复）
+
+**现象**：按 7.4 用 `regenerate: true` 重新归档、`summary_meta.json` 里 `mode=rules`、`fallback=true`，页面要点还是口语碎片。`python bridge.py --check` 几分钟前还是 `[PASS] bridge.summary`。
+
+**根因**：Ollama 是**独立进程**，不是 bridge 的一部分。它被关掉（或被崩溃的终端带走）之后，`_preflight_ollama()` 立刻失败（2 s 超时），`generate_summary` 按设计**降级回 rules**，于是"要点还是残句"。降级信息此前只写 stderr，而 bridge 用 `pythonw` 隐藏窗口运行——**没人看得到 stderr**，用户只能看到一个"没修好"的页面。
+
+**修复（三件事，缺一不可）**：
+
+1. **降级必须在页面上可见**：`_prepare_job_artifacts()` 在 `sres["fallback"]` 为真时，给 `summary.md` 加前缀
+   `> ⚠️ 本次摘要由**规则模式**生成（模型不可用：<原因>）` + 一行"如何恢复"（`/retry` 带 `regenerate:true`）。
+2. **bridge 启动时自愈**：`ensure_ollama()` 在 summary 需要模型时先探活，探不到就按 `ollama_exe` → `shutil.which` → `%LOCALAPPDATA%\Programs\Ollama\ollama.exe` → `ProgramFiles` 顺序找可执行文件，`subprocess.Popen([exe,"serve"], DETACHED_PROCESS|CREATE_NO_WINDOW, stdin/stdout/stderr=DEVNULL)` 拉起，再轮询探活 ≤12 s。返回 `running|started|missing|failed`，失败只写 stderr 不致命。
+3. **模型选型按内存来**：`qwen2.5:3b` 为默认（实测 44.5 s / 8 GB 机器）；`qwen2.5:7b` 需 **≥16 GB**，本机 7.83 GB 实测 215 s 超时回退。
+
+**排查法则**：
+
+1. **"功能降级"和"功能失效"要分清**：`summary_meta.json` 的 `mode`/`fallback`/`fallback_reason` 是唯一可靠的判定依据，先看它再读页面。
+2. **隐藏窗口运行的进程，stderr 等于没有**。任何用户可能感知的降级都要写进产物（页面/状态接口），不能只写 stderr。
+3. **依赖外部进程时必须自愈或显式报错**，不能让"另一个程序没开"表现为"你刚写的代码有 bug"。
+4. **本地 LLM 的模型大小要按内存选**，不要沿用常见的 7b 默认值；超时会表现为"什么都没发生"。
+
 ---
 
 ## 8. 安全与授权边界

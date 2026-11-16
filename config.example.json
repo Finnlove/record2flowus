@@ -8,8 +8,8 @@
   "bridge_allowed_origin": "chrome-extension://REPLACE_WITH_YOUR_EXTENSION_ID",
   "summary_mode": "rules",
   "ollama_url": "http://127.0.0.1:11434",
-  "ollama_model": "qwen2.5:7b",
-  "ollama_timeout": 90,
+  "ollama_model": "qwen2.5:3b",
+  "ollama_timeout": 180,
   "archive_artifacts_dir": "",
   "autostart": true
 }
