@@ -1329,7 +1329,8 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 self._send(200, {"ok": True, "archives": safe})
             except Exception as e:
-                self._send(500, {"ok": False, "error": str(e)})
+                sys.stderr.write("[bridge] /archives failed: %r\n" % (e,))
+                self._send(500, {"ok": False, "error": "internal error"})
 
         elif path == "/reset":
             with lock:

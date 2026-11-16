@@ -194,7 +194,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 ## Security notes
 
 - Controls local recording and writes to your FlowUs workspace.
-- Enforced: token auth (>=32 chars), loopback-only binding + Host validation, strict Origin checks (incl. missing Origin rejection when configured), `Content-Type` and request/input validation, FlowUs ID/URL checks, meeting/artifact path confinement, sanitized `/state`.
+- Enforced: token auth (>=32 chars), loopback-only binding + Host validation, Origin checks (**mismatching Origin rejected; requests without `Origin` are allowed** — Chrome 157+ extension service-worker fetches carry no `Origin`, so identity is enforced by the Bearer token), `Content-Type` and request/input validation, FlowUs ID/URL checks, meeting/artifact path confinement, sanitized `/state`.
 - CLI sync validates target IDs and constrains manifest/export paths.
 - Keep tokens/secrets and local IDs out of git; use only trusted local extension copies.
 
