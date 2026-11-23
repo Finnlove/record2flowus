@@ -14,6 +14,24 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+
+def _ensure_streams():
+    """Replace None stdout/stderr (pythonw.exe has no console) with devnull.
+
+    The autostart VBS launches this script with pythonw.exe, where sys.stdout and
+    sys.stderr are None. BaseHTTPRequestHandler.log_message() writes to stderr on
+    every request, and a None stderr raises AttributeError mid-response -> the
+    connection is closed without a reply -> the extension reports "本地桥接失败".
+    Redirecting the missing streams makes pythonw behave like a normal launch.
+    """
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
+
+_ensure_streams()
+
 # local helper (scripts/archive_store.py)
 BASE_DIR_IMPORT = os.path.dirname(os.path.abspath(__file__))
 if BASE_DIR_IMPORT not in sys.path:
